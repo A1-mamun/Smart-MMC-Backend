@@ -1,0 +1,324 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Enums
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  STUDENT
+}
+
+enum UserStatus {
+  ACTIVE
+  BANNED
+}
+
+enum EducationBoard {
+  DHAKA
+  CHITTAGONG
+  RAJSHAHI
+  COMILLA
+  SYLHET
+  BARISAL
+  JESSORE
+  MYMENSINGH
+  MADRASAH
+  TECHNICAL
+}
+
+enum BloodGroup {
+  A_POSITIVE
+  A_NEGATIVE
+  B_POSITIVE
+  B_NEGATIVE
+  AB_POSITIVE
+  AB_NEGATIVE
+  O_POSITIVE
+  O_NEGATIVE
+}
+
+enum HscBatch {
+  BATCH_25
+  BATCH_26
+  BATCH_27
+  BATCH_28
+}
+
+enum CourseName {
+  HSC_1ST_YEAR
+  HSC_2ND_YEAR
+  HSC_FINAL_PREPARATION
+  ADMISSION
+}
+
+enum PaymentMethod {
+  CASH
+  BKASH
+  NAGAD
+  BANK
+  OTHER
+}
+
+enum AttendanceMethod {
+  NFC
+  MANUAL
+  ADMIN
+}
+
+model User {
+  id                 String     @id @default(uuid())
+  studentId          String     @unique
+  name               String
+  nickname           String?
+  password           String
+  role               UserRole   @default(STUDENT)
+  status             UserStatus @default(ACTIVE)
+  passwordChangedAt  DateTime?
+  passwordLevel      Int        @default(0)
+  mustChangePassword Boolean    @default(true)
+  isDeleted          Boolean    @default(false)
+  deletedAt          DateTime?
+  deletedBy          String?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  student           Student?           @relation("UserStudent")
+  refreshTokens     RefreshToken[]
+  passwordResets    PasswordResetRequest[]
+  admittedStudents  Student[]          @relation("AdmittedBy")
+  collectedPayments Payment[]          @relation("CollectedBy")
+
+  @@index([studentId])
+  @@index([role])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("users")
+}
+
+model Student {
+  id              String         @id @default(uuid())
+  userId          String         @unique
+  college         String?
+  mobile          String
+  bloodGroup      BloodGroup
+  fatherName      String
+  fatherOccupation String
+  fatherMobile    String
+  motherName      String
+  motherOccupation String
+  motherMobile    String
+  addressVillage  String
+  addressPostOffice String
+  addressUpozila  String
+  addressDistrict String
+  sscInstitute    String
+  sscBoard        EducationBoard
+  sscPassingYear  Int
+  sscGpa          Decimal        @db.Decimal(4, 2)
+  admittedAt      DateTime       @default(now())
+  admittedBy      String
+  isDeleted       Boolean        @default(false)
+  deletedAt       DateTime?
+  deletedBy       String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  user          User           @relation("UserStudent", fields: [userId], references: [id], onDelete: Cascade)
+  admittedByUser User          @relation("AdmittedBy", fields: [admittedBy], references: [id])
+  studentCourses StudentCourse[]
+  batches       StudentBatch[]
+  payments      Payment[]
+  attendance    Attendance[]
+
+  @@index([mobile])
+  @@index([addressDistrict])
+  @@index([sscPassingYear])
+  @@index([admittedBy])
+  @@index([isDeleted])
+  @@map("students")
+}
+
+model Course {
+  id             String     @id @default(uuid())
+  name           CourseName
+  description    String?
+  fee            Decimal    @db.Decimal(10, 2)
+  hscBatch       HscBatch   @default(BATCH_27)
+  isActive       Boolean    @default(true)
+  isDeleted      Boolean    @default(false)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  studentCourses StudentCourse[]
+  batchDays      BatchDay[]
+
+  @@index([isActive])
+  @@index([isDeleted])
+  @@index([hscBatch])
+  @@map("courses")
+}
+
+model BatchDay {
+  id        String   @id @default(uuid())
+  courseId  String
+  name      String?
+  days      String[] @default([])
+  times     String[] @default([])
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  course Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@index([courseId])
+  @@map("batch_days")
+}
+
+model StudentCourse {
+  id          String    @id @default(uuid())
+  studentId   String
+  courseId    String
+  enrolledAt  DateTime  @default(now())
+  enrolledBy  String
+  isCompleted Boolean   @default(false)
+  completedAt DateTime?
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  student  Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course   Course   @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  payments Payment[]
+
+  @@unique([studentId, courseId])
+  @@index([studentId])
+  @@index([courseId])
+  @@index([isCompleted])
+  @@map("student_courses")
+}
+
+model StudentBatch {
+  id        String    @id @default(uuid())
+  studentId String
+  batchDay  String
+  batchTime String
+  hscBatch  HscBatch
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+  deletedBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([hscBatch])
+  @@index([studentId])
+  @@map("student_batches")
+}
+
+model Payment {
+  id              String        @id @default(uuid())
+  studentId       String
+  studentCourseId String?
+  amount          Decimal       @db.Decimal(10, 2)
+  method          PaymentMethod
+  transactionId   String?
+  senderNumber    String?
+  note            String?
+  dueDate         DateTime?
+  paidAt          DateTime?
+  collectedBy     String
+  isDeleted       Boolean       @default(false)
+  deletedAt       DateTime?
+  deletedBy       String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  student       Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentCourse StudentCourse? @relation(fields: [studentCourseId], references: [id], onDelete: SetNull)
+  collectedByUser User         @relation("CollectedBy", fields: [collectedBy], references: [id])
+
+  @@index([studentId])
+  @@index([paidAt])
+  @@index([method])
+  @@index([studentCourseId])
+  @@index([isDeleted])
+  @@map("payments")
+}
+
+model Attendance {
+  id          String           @id @default(uuid())
+  studentId   String
+  date        DateTime         @db.Date
+  checkInAt   DateTime         @default(now())
+  method      AttendanceMethod @default(NFC)
+  deviceId    String?
+  recordedBy  String?
+  createdAt   DateTime         @default(now())
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, date])
+  @@index([studentId])
+  @@index([date])
+  @@index([method])
+  @@map("attendance")
+}
+
+model ActivityLog {
+  id          String    @id @default(uuid())
+  actorId     String?
+  actorRole   UserRole?
+  action      String
+  entityType  String
+  entityId    String?
+  description String
+  metadata    Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime  @default(now())
+
+  @@index([actorId])
+  @@index([entityType])
+  @@index([createdAt])
+  @@index([action])
+  @@map("activity_logs")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetRequest {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@map("password_reset_requests")
+}
