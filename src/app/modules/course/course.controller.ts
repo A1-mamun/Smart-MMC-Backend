@@ -16,22 +16,17 @@ const createCourse = catchAsync(async (req, res) => {
 });
 
 const getAllCourses = catchAsync(async (req, res) => {
-  const filters = pick(req.query as Record<string, unknown>, [
-    'isActive',
-    'searchTerm',
-  ]);
-  const paginationOptions = pick(
-    req.query as Record<string, unknown>,
-    paginationFields,
-  );
+  const filters = pick(req.query as Record<string, unknown>, ['isActive', 'searchTerm']);
+  const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
   // Express query strings are always strings — coerce isActive manually.
   if (filters.isActive !== undefined) {
     if (filters.isActive === 'true') filters.isActive = true;
     else if (filters.isActive === 'false') filters.isActive = false;
   }
-  const result = await CourseService.getAllCoursesFromDB(
-    { ...filters, ...paginationOptions } as Parameters<typeof CourseService.getAllCoursesFromDB>[0],
-  );
+  const result = await CourseService.getAllCoursesFromDB({
+    ...filters,
+    ...paginationOptions,
+  } as Parameters<typeof CourseService.getAllCoursesFromDB>[0]);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -42,7 +37,7 @@ const getAllCourses = catchAsync(async (req, res) => {
 });
 
 const getCourseById = catchAsync(async (req, res) => {
-  const result = await CourseService.getCourseByIdFromDB(req.params.id);
+  const result = await CourseService.getCourseByIdFromDB(req.params.id as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -52,7 +47,7 @@ const getCourseById = catchAsync(async (req, res) => {
 });
 
 const updateCourse = catchAsync(async (req, res) => {
-  const result = await CourseService.updateCourseInDB(req.params.id, req.body);
+  const result = await CourseService.updateCourseInDB(req.params.id as string, req.body);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -62,7 +57,7 @@ const updateCourse = catchAsync(async (req, res) => {
 });
 
 const deleteCourse = catchAsync(async (req, res) => {
-  await CourseService.deleteCourseFromDB(req.params.id);
+  await CourseService.deleteCourseFromDB(req.params.id as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -73,7 +68,7 @@ const deleteCourse = catchAsync(async (req, res) => {
 
 const toggleActive = catchAsync(async (req, res) => {
   const result = await CourseService.toggleCourseActiveToDB(
-    req.params.id,
+    req.params.id as string,
     req.body.isActive,
   );
   sendResponse(res, {

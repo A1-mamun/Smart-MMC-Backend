@@ -5,10 +5,7 @@ import { StudentCourseService } from './studentCourse.service';
 import { JwtPayload } from 'jsonwebtoken';
 
 const enrollStudent = catchAsync(async (req, res) => {
-  const result = await StudentCourseService.enrollStudentToDB(
-    req.body,
-    req.user as JwtPayload,
-  );
+  const result = await StudentCourseService.enrollStudentToDB(req.body, req.user as JwtPayload);
   sendResponse(res, {
     statusCode: httpStatus.CREATED,
     success: true,
@@ -19,7 +16,7 @@ const enrollStudent = catchAsync(async (req, res) => {
 
 const completeCourse = catchAsync(async (req, res) => {
   const result = await StudentCourseService.completeCourseFromDB(
-    req.params.id,
+    req.params.id as string,
     req.user as JwtPayload,
   );
   sendResponse(res, {
@@ -31,7 +28,7 @@ const completeCourse = catchAsync(async (req, res) => {
 });
 
 const getStudentCourses = catchAsync(async (req, res) => {
-  const result = await StudentCourseService.getStudentCoursesFromDB(req.params.studentId);
+  const result = await StudentCourseService.getStudentCoursesFromDB(req.params.studentId as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -41,10 +38,7 @@ const getStudentCourses = catchAsync(async (req, res) => {
 });
 
 const unenroll = catchAsync(async (req, res) => {
-  await StudentCourseService.unenrollFromDB(
-    req.params.id,
-    req.user as JwtPayload,
-  );
+  await StudentCourseService.unenrollFromDB(req.params.id as string, req.user as JwtPayload);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,

@@ -174,7 +174,8 @@ model BatchDay {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  course Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  course         Course         @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  studentBatches StudentBatch[]
 
   @@index([courseId])
   @@map("batch_days")
@@ -206,21 +207,24 @@ model StudentCourse {
 }
 
 model StudentBatch {
-  id        String    @id @default(uuid())
-  studentId String
-  batchDay  String
-  batchTime String
-  hscBatch  HscBatch
-  isDeleted Boolean   @default(false)
-  deletedAt DateTime?
-  deletedBy String?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  id         String  @id @default(uuid())
+  studentId  String
+  batchDayId String?
+  batchDay   String
+  batchTime  String
+  hscBatch   HscBatch
+  isDeleted  Boolean   @default(false)
+  deletedAt  DateTime?
+  deletedBy  String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
 
-  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  student       Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  batchDayRel BatchDay? @relation(fields: [batchDayId], references: [id], onDelete: SetNull)
 
   @@index([hscBatch])
   @@index([studentId])
+  @@index([batchDayId])
   @@map("student_batches")
 }
 

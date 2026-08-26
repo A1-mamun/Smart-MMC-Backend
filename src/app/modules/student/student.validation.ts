@@ -25,12 +25,12 @@ const boards = [
 ] as const;
 
 const hscBatches = ['BATCH_25', 'BATCH_26', 'BATCH_27', 'BATCH_28'] as const;
-const courseNames = [
-  'HSC_1ST_YEAR',
-  'HSC_2ND_YEAR',
-  'HSC_FINAL_PREPARATION',
-  'ADMISSION',
-] as const;
+// const courseNames = [
+//   'HSC_1ST_YEAR',
+//   'HSC_2ND_YEAR',
+//   'HSC_FINAL_PREPARATION',
+//   'ADMISSION',
+// ] as const;
 
 const phoneRegex = /^01[3-9]\d{8}$/;
 const batchTimeRegex = /^(0?[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$/i;
@@ -96,6 +96,7 @@ const getAllStudentsSchema = z.object({
     hscBatch: z.enum(hscBatches).optional(),
     courseId: z.string().uuid().optional(),
     batchDay: z.string().optional(),
+    batchDayId: z.string().uuid().optional(),
     batchTime: z.string().optional(),
     district: z.string().optional(),
     page: z.coerce.number().int().min(1).optional(),

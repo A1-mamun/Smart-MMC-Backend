@@ -8,7 +8,7 @@ const handleZodError = (err: ZodError): TGenericErrorResponse => {
       issue.path.length > 0
         ? typeof issue.path[issue.path.length - 1] === 'number'
           ? issue.path.join('.')
-          : issue.path[issue.path.length - 1]
+          : String(issue.path[issue.path.length - 1])
         : '',
     message: issue.message,
   }));

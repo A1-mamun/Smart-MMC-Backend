@@ -7,10 +7,7 @@ import { paginationFields } from '../../constant/pagination';
 import { JwtPayload } from 'jsonwebtoken';
 
 const recordPayment = catchAsync(async (req, res) => {
-  const result = await PaymentService.recordPaymentToDB(
-    req.body,
-    req.user as JwtPayload,
-  );
+  const result = await PaymentService.recordPaymentToDB(req.body, req.user as JwtPayload);
   sendResponse(res, {
     statusCode: httpStatus.CREATED,
     success: true,
@@ -28,13 +25,11 @@ const getAllPayments = catchAsync(async (req, res) => {
     'endDate',
     'paid',
   ]);
-  const paginationOptions = pick(
-    req.query as Record<string, unknown>,
-    paginationFields,
-  );
-  const result = await PaymentService.getAllPaymentsFromDB(
-    { ...filters, ...paginationOptions } as Parameters<typeof PaymentService.getAllPaymentsFromDB>[0],
-  );
+  const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
+  const result = await PaymentService.getAllPaymentsFromDB({
+    ...filters,
+    ...paginationOptions,
+  } as Parameters<typeof PaymentService.getAllPaymentsFromDB>[0]);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -55,7 +50,7 @@ const getDuePayments = catchAsync(async (_req, res) => {
 });
 
 const getStudentPayments = catchAsync(async (req, res) => {
-  const result = await PaymentService.getStudentPaymentsFromDB(req.params.studentId);
+  const result = await PaymentService.getStudentPaymentsFromDB(req.params.studentId as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -65,7 +60,7 @@ const getStudentPayments = catchAsync(async (req, res) => {
 });
 
 const updatePayment = catchAsync(async (req, res) => {
-  const result = await PaymentService.updatePaymentInDB(req.params.id, req.body);
+  const result = await PaymentService.updatePaymentInDB(req.params.id as string, req.body);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -75,10 +70,7 @@ const updatePayment = catchAsync(async (req, res) => {
 });
 
 const deletePayment = catchAsync(async (req, res) => {
-  await PaymentService.deletePaymentFromDB(
-    req.params.id,
-    req.user as JwtPayload,
-  );
+  await PaymentService.deletePaymentFromDB(req.params.id as string, req.user as JwtPayload);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,

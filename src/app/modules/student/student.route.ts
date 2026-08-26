@@ -25,11 +25,7 @@ router.get(
   StudentController.getAllStudents,
 );
 
-router.get(
-  '/me/profile',
-  Auth(USER_ROLE.STUDENT),
-  StudentController.getMyProfile,
-);
+router.get('/me/profile', Auth(USER_ROLE.STUDENT), StudentController.getMyProfile);
 
 router.get(
   '/:id',

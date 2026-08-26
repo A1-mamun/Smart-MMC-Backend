@@ -6,11 +6,7 @@ import AppError from '../../errors/AppError';
 import config from '../../config';
 import generateStudentId from '../../utils/generateStudentId';
 import generateInitialPassword from '../../utils/generatePassword';
-import {
-  TAdmitStudent,
-  TUpdateStudent,
-  TGetAllStudents,
-} from './student.validation';
+import { TAdmitStudent, TUpdateStudent, TGetAllStudents } from './student.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearStudentCache } from '../../utils/clearCache';
 import { JwtPayload } from 'jsonwebtoken';
@@ -33,6 +29,7 @@ const studentInclude = {
   },
   batches: {
     where: { isDeleted: false },
+    include: { batchDayRel: true },
   },
   payments: {
     where: { isDeleted: false },
@@ -52,10 +49,7 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
     where: { mobile: payload.mobile, isDeleted: false },
   });
   if (existingByMobile) {
-    throw new AppError(
-      httpStatus.CONFLICT,
-      'A student with this mobile number already exists',
-    );
+    throw new AppError(httpStatus.CONFLICT, 'A student with this mobile number already exists');
   }
 
   const course = await prisma.course.findUnique({
@@ -66,34 +60,20 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
     throw new AppError(httpStatus.BAD_REQUEST, 'Selected course not found');
   }
   if (!course.isActive) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      'Selected course is not active',
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, 'Selected course is not active');
   }
 
-  const matchingBatchDay = course.batchDays.find(
-    (d) => d.id === payload.batchDayId,
-  );
+  const matchingBatchDay = course.batchDays.find((d) => d.id === payload.batchDayId);
   if (!matchingBatchDay) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      `Selected batch day does not belong to this course`,
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, `Selected batch day does not belong to this course`);
   }
   if (!matchingBatchDay.times.includes(payload.batchTime)) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      `Selected time is not offered for this batch day`,
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, `Selected time is not offered for this batch day`);
   }
 
   const studentId = await generateStudentId(course.hscBatch, course.name);
   const initialPassword = generateInitialPassword(10);
-  const hashedPassword = await bcrypt.hash(
-    initialPassword,
-    Number(config.bcryptSaltRounds) || 12,
-  );
+  const hashedPassword = await bcrypt.hash(initialPassword, Number(config.bcryptSaltRounds) || 12);
 
   const student = await prisma.$transaction(async (tx) => {
     const newUser = await tx.user.create({
@@ -143,8 +123,10 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
     await tx.studentBatch.create({
       data: {
         studentId: newStudent.id,
-        // Use the first day of the selected batch day's days[].
-        batchDay: matchingBatchDay.days[0],
+        // Use the name of the selected batch day.
+        batchDay: matchingBatchDay.name as string,
+        // Also link the FK so the cascading filter works.
+        batchDayId: matchingBatchDay.id,
         batchTime: payload.batchTime,
         hscBatch: course.hscBatch,
       },
@@ -187,15 +169,11 @@ const getAllStudentsFromDB = async (
   options: { page?: number; limit?: number; sortBy?: string; sortOrder?: 'asc' | 'desc' },
 ) => {
   const { page, limit, skip, sortBy, sortOrder } = calculatePagination(options);
-  const {
-    searchTerm,
-    hscBatch,
-    courseId,
-    batchDay,
-    batchTime,
-    district,
-    ...rest
-  } = filters;
+  const { searchTerm, hscBatch, courseId, batchDay, batchDayId, batchTime, district, ...rest } =
+    filters;
+
+  // console.log('filters:', filters);
+  // console.log('options:', options);
 
   const andConditions: Prisma.StudentWhereInput[] = [{ isDeleted: false }];
 
@@ -223,6 +201,20 @@ const getAllStudentsFromDB = async (
     });
   }
 
+  if (batchDayId) {
+    // Filter by the specific BatchDay row (e.g. "Weekend" / "Weekday")
+    // using the StudentBatch.batchDayId foreign key. The chosen day and
+    // time correspondence is preserved.
+    andConditions.push({
+      batches: {
+        some: {
+          batchDayId,
+          isDeleted: false,
+        },
+      },
+    });
+  }
+
   if (batchDay || batchTime) {
     const batchWhere: Prisma.StudentBatchWhereInput = { isDeleted: false };
     if (batchDay) batchWhere.batchDay = batchDay;
@@ -238,7 +230,7 @@ const getAllStudentsFromDB = async (
 
   if (Object.keys(rest).length > 0) {
     andConditions.push({
-      AND: Object.entries(rest).map(([k, v]) => ({ [k]: v } as Prisma.StudentWhereInput)),
+      AND: Object.entries(rest).map(([k, v]) => ({ [k]: v }) as Prisma.StudentWhereInput),
     });
   }
 
@@ -287,11 +279,7 @@ const getStudentByIdFromDB = async (id: string) => {
   return student;
 };
 
-const updateStudentInDB = async (
-  id: string,
-  payload: TUpdateStudent['body'],
-  user: JwtPayload,
-) => {
+const updateStudentInDB = async (id: string, payload: TUpdateStudent['body'], user: JwtPayload) => {
   const existing = await prisma.student.findUnique({ where: { id } });
   if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
 
@@ -300,23 +288,19 @@ const updateStudentInDB = async (
   if (payload.mobile !== undefined) data.mobile = payload.mobile;
   if (payload.bloodGroup !== undefined) data.bloodGroup = payload.bloodGroup;
   if (payload.fatherName !== undefined) data.fatherName = payload.fatherName;
-  if (payload.fatherOccupation !== undefined)
-    data.fatherOccupation = payload.fatherOccupation;
+  if (payload.fatherOccupation !== undefined) data.fatherOccupation = payload.fatherOccupation;
   if (payload.fatherMobile !== undefined) data.fatherMobile = payload.fatherMobile;
   if (payload.motherName !== undefined) data.motherName = payload.motherName;
-  if (payload.motherOccupation !== undefined)
-    data.motherOccupation = payload.motherOccupation;
+  if (payload.motherOccupation !== undefined) data.motherOccupation = payload.motherOccupation;
   if (payload.motherMobile !== undefined) data.motherMobile = payload.motherMobile;
   if (payload.addressVillage !== undefined) data.addressVillage = payload.addressVillage;
-  if (payload.addressPostOffice !== undefined)
-    data.addressPostOffice = payload.addressPostOffice;
+  if (payload.addressPostOffice !== undefined) data.addressPostOffice = payload.addressPostOffice;
   if (payload.addressUpozila !== undefined) data.addressUpozila = payload.addressUpozila;
   if (payload.addressDistrict !== undefined) data.addressDistrict = payload.addressDistrict;
   if (payload.sscInstitute !== undefined) data.sscInstitute = payload.sscInstitute;
   if (payload.sscBoard !== undefined) data.sscBoard = payload.sscBoard;
   if (payload.sscPassingYear !== undefined) data.sscPassingYear = payload.sscPassingYear;
-  if (payload.sscGpa !== undefined)
-    data.sscGpa = new Prisma.Decimal(payload.sscGpa);
+  if (payload.sscGpa !== undefined) data.sscGpa = new Prisma.Decimal(payload.sscGpa);
 
   const result = await prisma.$transaction(async (tx) => {
     if (payload.name !== undefined || payload.nickname !== undefined) {
@@ -351,11 +335,7 @@ const updateStudentInDB = async (
   return result;
 };
 
-const deleteStudentFromDB = async (
-  id: string,
-  user: JwtPayload,
-  hard: boolean = false,
-) => {
+const deleteStudentFromDB = async (id: string, user: JwtPayload, hard: boolean = false) => {
   const existing = await prisma.student.findUnique({ where: { id } });
   if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
 

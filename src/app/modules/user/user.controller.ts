@@ -18,10 +18,7 @@ const createUser = catchAsync(async (req, res) => {
 
 const getAllUsers = catchAsync(async (req, res) => {
   const filters = pick(req.query as Record<string, unknown>, ['searchTerm', 'role']);
-  const paginationOptions = pick(
-    req.query as Record<string, unknown>,
-    paginationFields,
-  );
+  const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
   const result = await AuthService.getAllUsersFromDB(
     filters as Pick<TGetAllUsers, 'searchTerm' | 'role'>,
     paginationOptions as Pick<TGetAllUsers, 'page' | 'limit' | 'sortBy' | 'sortOrder'>,
@@ -36,7 +33,7 @@ const getAllUsers = catchAsync(async (req, res) => {
 });
 
 const getUserById = catchAsync(async (req, res) => {
-  const result = await AuthService.getUserByIdFromDB(req.params.id);
+  const result = await AuthService.getUserByIdFromDB(req.params.id as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -47,7 +44,7 @@ const getUserById = catchAsync(async (req, res) => {
 
 const updateUser = catchAsync(async (req, res) => {
   const result = await AuthService.updateUserInDB(
-    req.params.id,
+    req.params.id as string,
     (req.body as TUpdateUser['body']) || {},
   );
   sendResponse(res, {
@@ -60,7 +57,7 @@ const updateUser = catchAsync(async (req, res) => {
 
 const deleteUser = catchAsync(async (req, res) => {
   const actorId = (req.user as { userId: string }).userId;
-  await AuthService.deleteUserFromDB(req.params.id, actorId);
+  await AuthService.deleteUserFromDB(req.params.id as string, actorId);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,

@@ -1,4 +1,4 @@
-import { TPaginationOptions, TPaginationResult } from '../app/interface/pagination';
+import { TPaginationOptions, TPaginationResult } from '../interface/pagination';
 
 const calculatePagination = (options: TPaginationOptions): TPaginationResult => {
   const page = Number(options.page) || 1;

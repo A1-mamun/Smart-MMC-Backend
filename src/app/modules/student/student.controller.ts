@@ -3,9 +3,7 @@ import catchAsync from '../../utils/catchAsync';
 import sendResponse from '../../utils/sendResponse';
 import pick from '../../utils/pick';
 import { StudentService } from './student.service';
-import {
-  studentFilterableFields,
-} from './student.constant';
+import { studentFilterableFields } from './student.constant';
 import { paginationFields } from '../../constant/pagination';
 import { JwtPayload } from 'jsonwebtoken';
 
@@ -27,10 +25,7 @@ const admitStudent = catchAsync(async (req, res) => {
 
 const getAllStudents = catchAsync(async (req, res) => {
   const filters = pick(req.query as Record<string, unknown>, studentFilterableFields);
-  const paginationOptions = pick(
-    req.query as Record<string, unknown>,
-    paginationFields,
-  );
+  const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
   const result = await StudentService.getAllStudentsFromDB(
     filters as Parameters<typeof StudentService.getAllStudentsFromDB>[0],
     paginationOptions as Parameters<typeof StudentService.getAllStudentsFromDB>[1],
@@ -45,7 +40,7 @@ const getAllStudents = catchAsync(async (req, res) => {
 });
 
 const getStudentById = catchAsync(async (req, res) => {
-  const result = await StudentService.getStudentByIdFromDB(req.params.id);
+  const result = await StudentService.getStudentByIdFromDB(req.params.id as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -56,7 +51,7 @@ const getStudentById = catchAsync(async (req, res) => {
 
 const updateStudent = catchAsync(async (req, res) => {
   const result = await StudentService.updateStudentInDB(
-    req.params.id,
+    req.params.id as string,
     req.body,
     req.user as JwtPayload,
   );
@@ -70,7 +65,7 @@ const updateStudent = catchAsync(async (req, res) => {
 
 const deleteStudent = catchAsync(async (req, res) => {
   await StudentService.deleteStudentFromDB(
-    req.params.id,
+    req.params.id as string,
     req.user as JwtPayload,
     req.body?.hard || false,
   );

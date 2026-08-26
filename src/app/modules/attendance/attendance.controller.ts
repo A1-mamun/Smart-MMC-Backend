@@ -18,10 +18,7 @@ const checkIn = catchAsync(async (req, res) => {
 });
 
 const manualCheckIn = catchAsync(async (req, res) => {
-  const result = await AttendanceService.manualCheckInToDB(
-    req.body,
-    req.user as JwtPayload,
-  );
+  const result = await AttendanceService.manualCheckInToDB(req.body, req.user as JwtPayload);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -31,18 +28,12 @@ const manualCheckIn = catchAsync(async (req, res) => {
 });
 
 const getToday = catchAsync(async (req, res) => {
-  const filters = pick(req.query as Record<string, unknown>, [
-    'batchDay',
-    'batchTime',
-    'hscBatch',
-  ]);
-  const paginationOptions = pick(
-    req.query as Record<string, unknown>,
-    paginationFields,
-  );
-  const result = await AttendanceService.getTodayAttendanceFromDB(
-    { ...filters, ...paginationOptions } as Parameters<typeof AttendanceService.getTodayAttendanceFromDB>[0],
-  );
+  const filters = pick(req.query as Record<string, unknown>, ['batchDay', 'batchTime', 'hscBatch']);
+  const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
+  const result = await AttendanceService.getTodayAttendanceFromDB({
+    ...filters,
+    ...paginationOptions,
+  } as Parameters<typeof AttendanceService.getTodayAttendanceFromDB>[0]);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
@@ -77,10 +68,7 @@ const getStats = catchAsync(async (_req, res) => {
 });
 
 const deleteAttendance = catchAsync(async (req, res) => {
-  await AttendanceService.deleteAttendanceFromDB(
-    req.params.id,
-    req.user as JwtPayload,
-  );
+  await AttendanceService.deleteAttendanceFromDB(req.params.id as string, req.user as JwtPayload);
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
