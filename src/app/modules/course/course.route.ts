@@ -34,7 +34,7 @@ router.get(
 
 router.patch(
   '/:id',
-  Auth(USER_ROLE.SUPER_ADMIN),
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
   writeOperationRateLimiter,
   validateRequest(CourseValidation.updateCourseSchema),
   CourseController.updateCourse,
