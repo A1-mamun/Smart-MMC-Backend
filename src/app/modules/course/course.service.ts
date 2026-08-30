@@ -21,7 +21,7 @@ const createCourseToDB = async (payload: TCreateCourse) => {
     throw new AppError(httpStatus.CONFLICT, 'Course with this name already exists');
   }
 
-  return prisma.$transaction(async (tx) => {
+  const course = await prisma.$transaction(async (tx) => {
     // Check schedule conflicts BEFORE creating anything
     await checkBatchTimeConflict(tx, payload.batchDays);
     const course = await tx.course.create({
@@ -48,6 +48,9 @@ const createCourseToDB = async (payload: TCreateCourse) => {
       include: courseInclude,
     });
   });
+
+  await clearCourseCache();
+  return course;
 };
 
 const getAllCoursesFromDB = async (filters: TGetAllCourses) => {
