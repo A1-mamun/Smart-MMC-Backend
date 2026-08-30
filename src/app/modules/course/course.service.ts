@@ -5,6 +5,7 @@ import AppError from '../../errors/AppError';
 import { TCreateCourse, TUpdateCourse, TGetAllCourses, TBatchDayInput } from './course.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearCourseCache } from '../../utils/clearCache';
+import { checkBatchTimeConflict } from '../../utils/checkBatchTimeConflict';
 
 const courseInclude = {
   batchDays: {
@@ -21,6 +22,8 @@ const createCourseToDB = async (payload: TCreateCourse) => {
   }
 
   return prisma.$transaction(async (tx) => {
+    // Check schedule conflicts BEFORE creating anything
+    await checkBatchTimeConflict(tx, payload.batchDays);
     const course = await tx.course.create({
       data: {
         name: payload.name,
@@ -83,32 +86,120 @@ const getCourseByIdFromDB = async (id: string) => {
   return course;
 };
 
+// const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
+//   const data: Prisma.CourseUpdateInput = {};
+//   if (payload.name) data.name = payload.name;
+//   if (payload.description !== undefined) data.description = payload.description;
+//   if (payload.fee !== undefined) data.fee = new Prisma.Decimal(payload.fee);
+//   if (payload.hscBatch) data.hscBatch = payload.hscBatch;
+//   if (payload.isActive !== undefined) data.isActive = payload.isActive;
+
+//   const updated = await prisma.$transaction(async (tx) => {
+//     await tx.course.update({ where: { id }, data });
+//     if (payload.batchDays) {
+//       await tx.batchDay.deleteMany({ where: { courseId: id } });
+//       for (const [position, day] of payload.batchDays.entries()) {
+//         await tx.batchDay.create({
+//           data: {
+//             courseId: id,
+//             name: day.name,
+//             days: day.days,
+//             times: day.times,
+//             position,
+//           },
+//         });
+//       }
+//     }
+//     return tx.course.findUnique({
+//       where: { id },
+//       include: courseInclude,
+//     });
+//   });
+
+//   await clearCourseCache();
+//   return updated;
+// };
+
 const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
   const data: Prisma.CourseUpdateInput = {};
-  if (payload.name) data.name = payload.name;
-  if (payload.description !== undefined) data.description = payload.description;
-  if (payload.fee !== undefined) data.fee = new Prisma.Decimal(payload.fee);
-  if (payload.hscBatch) data.hscBatch = payload.hscBatch;
-  if (payload.isActive !== undefined) data.isActive = payload.isActive;
+
+  if (payload.name !== undefined) {
+    data.name = payload.name;
+  }
+
+  if (payload.description !== undefined) {
+    data.description = payload.description;
+  }
+
+  if (payload.fee !== undefined) {
+    data.fee = new Prisma.Decimal(payload.fee);
+  }
+
+  if (payload.hscBatch !== undefined) {
+    data.hscBatch = payload.hscBatch;
+  }
+
+  if (payload.isActive !== undefined) {
+    data.isActive = payload.isActive;
+  }
 
   const updated = await prisma.$transaction(async (tx) => {
-    await tx.course.update({ where: { id }, data });
-    if (payload.batchDays) {
-      await tx.batchDay.deleteMany({ where: { courseId: id } });
-      for (const [position, day] of payload.batchDays.entries()) {
-        await tx.batchDay.create({
-          data: {
-            courseId: id,
-            name: day.name,
-            days: day.days,
-            times: day.times,
-            position,
-          },
-        });
-      }
+    // Check whether course exists
+    const existingCourse = await tx.course.findUnique({
+      where: {
+        id,
+      },
+    });
+
+    if (!existingCourse) {
+      throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
     }
+
+    /*
+     * Only check schedule conflicts when batchDays
+     * are actually being updated.
+     */
+    if (payload.batchDays) {
+      await checkBatchTimeConflict(
+        tx,
+        payload.batchDays,
+        id, // Exclude current course
+      );
+    }
+
+    // Update course information
+    await tx.course.update({
+      where: {
+        id,
+      },
+      data,
+    });
+
+    /*
+     * Replace existing batch days
+     */
+    if (payload.batchDays) {
+      await tx.batchDay.deleteMany({
+        where: {
+          courseId: id,
+        },
+      });
+
+      await tx.batchDay.createMany({
+        data: payload.batchDays.map((day, position) => ({
+          courseId: id,
+          name: day.name,
+          days: day.days,
+          times: day.times,
+          position,
+        })),
+      });
+    }
+
     return tx.course.findUnique({
-      where: { id },
+      where: {
+        id,
+      },
       include: courseInclude,
     });
   });

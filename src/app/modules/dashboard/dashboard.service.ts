@@ -1,14 +1,13 @@
 import dayjs from 'dayjs';
 import prisma from '../../utils/prisma';
+import { PaymentStatus } from '@prisma/client';
 
 const getAdminDashboardDataFromDB = async () => {
   const now = dayjs();
   const startOfMonth = now.startOf('month').toDate();
-  const startOfLastMonth = now.subtract(1, 'month').startOf('month').toDate();
 
   const [
     totalStudents,
-    totalActiveStudents,
     paymentsThisMonthAgg,
     paymentsAllTimeAgg,
     overdueAgg,
@@ -16,8 +15,12 @@ const getAdminDashboardDataFromDB = async () => {
     monthAttendance,
     batchGroups,
     recentActivities,
+    // Count students whose every active enrollment has status = PAID.
+    // Since a single groupBy can't easily express "all per student are PAID",
+    // we fetch the (studentId, status) pairs and bucket in JS. This is bounded
+    // by the number of active enrollments, not the number of students.
+    paidEnrollmentCount,
   ] = await Promise.all([
-    prisma.student.count({ where: { isDeleted: false } }),
     prisma.student.count({ where: { isDeleted: false } }),
     prisma.payment.aggregate({
       where: { isDeleted: false, paidAt: { gte: startOfMonth } },
@@ -29,9 +32,8 @@ const getAdminDashboardDataFromDB = async () => {
       _sum: { amount: true },
       _count: true,
     }),
-    prisma.payment.aggregate({
+    prisma.payment.count({
       where: { isDeleted: false, dueDate: { lt: now.toDate() }, paidAt: null },
-      _count: true,
     }),
     prisma.attendance.count({
       where: { date: now.startOf('day').toDate() },
@@ -48,46 +50,54 @@ const getAdminDashboardDataFromDB = async () => {
       orderBy: { createdAt: 'desc' },
       take: 10,
     }),
+    prisma.studentCourse.count({
+      where: { isDeleted: false, status: PaymentStatus.PAID },
+    }),
   ]);
 
-  const fullyPaidStudents = await prisma.studentCourse.count({
-    where: { isDeleted: false, isCompleted: true },
+  // Get all active enrollments with their persisted status. Use that to
+  // compute per-student payment-status counts (PAID, PARTIAL, PENDING).
+  const activeEnrollments = await prisma.studentCourse.findMany({
+    where: { isDeleted: false, student: { isDeleted: false } },
+    select: { studentId: true, status: true },
   });
 
-  const pendingPaymentStudents = await prisma.student.findMany({
-    where: {
-      isDeleted: false,
-      studentCourses: { some: { isDeleted: false, isCompleted: false } },
-    },
-    include: {
-      studentCourses: {
-        where: { isDeleted: false, isCompleted: false },
-        include: { course: true, payments: { where: { isDeleted: false } } },
-      },
-    },
-  });
+  // Track which student has at least one active enrollment and the set of
+  // statuses across their enrollments. Then derive their overall bucket.
+  const studentStatusSets = new Map<string, Set<string>>();
+  for (const e of activeEnrollments) {
+    if (!studentStatusSets.has(e.studentId)) {
+      studentStatusSets.set(e.studentId, new Set());
+    }
+    studentStatusSets.get(e.studentId)!.add(e.status);
+  }
 
-  const dueStudents = pendingPaymentStudents
-    .map((s) => {
-      const totalDue = s.studentCourses.reduce((sum, sc) => {
-        const paid = sc.payments.reduce((p, pay) => p + Number(pay.amount), 0);
-        return sum + Math.max(0, Number(sc.course.fee) - paid);
-      }, 0);
-      return { id: s.id, name: s.userId, totalDue };
-    })
-    .filter((s) => s.totalDue > 0);
+  let fullyPaidCount = 0;
+  let partialCount = 0;
+  let pendingCount = 0;
+  for (const statuses of studentStatusSets.values()) {
+    if (statuses.size === 1 && statuses.has(PaymentStatus.PAID)) {
+      fullyPaidCount += 1;
+    } else if (statuses.has(PaymentStatus.PARTIAL)) {
+      partialCount += 1;
+    } else {
+      pendingCount += 1;
+    }
+  }
 
   return {
     cards: {
       totalStudents,
-      fullyPaidStudents,
-      pendingPaymentStudents: dueStudents.length,
-      overdueRecords: overdueAgg._count,
+      fullyPaidStudents: fullyPaidCount,
+      partialPaymentStudents: partialCount,
+      pendingPaymentStudents: pendingCount,
+      overdueRecords: overdueAgg,
       collectedThisMonth: Number(paymentsThisMonthAgg._sum.amount || 0),
       collectedAllTime: Number(paymentsAllTimeAgg._sum.amount || 0),
       todayAttendance,
       monthAttendance,
     },
+    paidEnrollmentCount,
     recentActivities,
     batchGroups: batchGroups.map((b) => ({
       hscBatch: b.hscBatch,
@@ -95,7 +105,6 @@ const getAdminDashboardDataFromDB = async () => {
       batchTime: b.batchTime,
       studentCount: b._count.studentId,
     })),
-    _meta: { startOfLastMonth },
     generatedAt: new Date().toISOString(),
   };
 };
@@ -139,13 +148,15 @@ const getStudentDashboardDataFromDB = async (userId: string) => {
     },
     courses: student.studentCourses.map((sc) => {
       const paid = sc.payments.reduce((p, pay) => p + Number(pay.amount), 0);
+      const fee = Number(sc.course.fee);
       return {
         id: sc.id,
         courseName: sc.course.name,
-        fee: Number(sc.course.fee),
+        fee,
         paid,
-        due: Math.max(0, Number(sc.course.fee) - paid),
+        due: Math.max(0, fee - paid),
         isCompleted: sc.isCompleted,
+        status: sc.status,
       };
     }),
     attendance: {

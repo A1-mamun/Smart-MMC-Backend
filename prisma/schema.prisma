@@ -65,6 +65,12 @@ enum PaymentMethod {
   OTHER
 }
 
+enum PaymentStatus {
+  PENDING
+  PARTIAL
+  PAID
+}
+
 enum AttendanceMethod {
   NFC
   MANUAL
@@ -189,6 +195,7 @@ model StudentCourse {
   enrolledBy  String
   isCompleted Boolean   @default(false)
   completedAt DateTime?
+  status      PaymentStatus @default(PENDING)
   isDeleted   Boolean   @default(false)
   deletedAt   DateTime?
   deletedBy   String?
@@ -203,6 +210,7 @@ model StudentCourse {
   @@index([studentId])
   @@index([courseId])
   @@index([isCompleted])
+  @@index([status])
   @@map("student_courses")
 }
 

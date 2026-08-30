@@ -51,8 +51,8 @@ async function main() {
       description: 'HSC 1st Year comprehensive course',
       hscBatch: 'BATCH_27',
       batchDays: [
-        { name: 'Weekend', days: ['Saturday', 'Sunday'], times: ['4:00 PM'] },
-        { name: 'Weekday', days: ['Monday', 'Wednesday'], times: ['7:00 AM'] },
+        { name: 'SAT', days: ['Saturday', 'Monday', 'Wednesday'], times: ['3:00 PM', '4:30 PM'] },
+        { name: 'SUN', days: ['Sunday', 'Tuesday', 'Thursday'], times: ['7:00 AM', '8:30 AM'] },
       ],
     },
     {
@@ -61,8 +61,12 @@ async function main() {
       description: 'HSC 2nd Year comprehensive course',
       hscBatch: 'BATCH_27',
       batchDays: [
-        { name: 'Sat-Mon-Wed', days: ['Saturday', 'Monday', 'Wednesday'], times: ['7:00 AM', '4:00 PM'] },
-        { name: 'Tue-Thu', days: ['Tuesday', 'Thursday'], times: ['4:00 PM'] },
+        {
+          name: 'SAT',
+          days: ['Saturday', 'Monday', 'Wednesday'],
+          times: ['7:00 AM', '8:30 AM'],
+        },
+        { name: 'SUN', days: ['Sunday', 'Tuesday', 'Thursday'], times: ['3:00 PM', '4:30 PM'] },
       ],
     },
     {
@@ -71,7 +75,16 @@ async function main() {
       description: 'Final preparation / model test batch',
       hscBatch: 'BATCH_27',
       batchDays: [
-        { name: 'Sat-Tue-Fri', days: ['Saturday', 'Tuesday', 'Friday'], times: ['7:00 AM'] },
+        {
+          name: 'SAT-FRI',
+          days: ['Saturday', 'Monday', 'Wednesday', 'Friday'],
+          times: ['5:00 PM'],
+        },
+        {
+          name: 'SUN-FRI',
+          days: ['Sunday', 'Tuesday', 'Thursday', 'Friday'],
+          times: ['6:00 PM'],
+        },
       ],
     },
     {
@@ -80,8 +93,12 @@ async function main() {
       description: 'University admission preparation',
       hscBatch: 'BATCH_27',
       batchDays: [
-        { name: 'Sun-Tue-Thu', days: ['Sunday', 'Tuesday', 'Thursday'], times: ['4:00 PM'] },
-        { name: 'Sat-Mon-Wed', days: ['Saturday', 'Monday', 'Wednesday'], times: ['7:00 AM', '4:00 PM'] },
+        { name: 'SUN', days: ['Sunday', 'Tuesday', 'Thursday'], times: ['4:00 PM'] },
+        {
+          name: 'SAT',
+          days: ['Saturday', 'Monday', 'Wednesday'],
+          times: ['10:00 AM', '7:00 PM'],
+        },
       ],
     },
   ];

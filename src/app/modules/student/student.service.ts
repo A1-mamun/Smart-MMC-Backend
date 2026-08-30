@@ -25,7 +25,10 @@ const studentInclude = {
   },
   studentCourses: {
     where: { isDeleted: false },
-    include: { course: true },
+    include: {
+      course: true,
+      payments: { where: { isDeleted: false }, select: { amount: true } },
+    },
   },
   batches: {
     where: { isDeleted: false },
@@ -251,9 +254,49 @@ const getAllStudentsFromDB = async (
     prisma.student.count({ where }),
   ]);
 
+  // Derive a per-student paymentStatus from the persisted StudentCourse.status
+  // values. A student with no active enrollments is PENDING. If every active
+  // enrollment is PAID, the student is PAID. If any is PARTIAL and none is
+  // PAID, the student is PARTIAL. Otherwise PENDING.
+  const dataWithStatus = data.map((s) => {
+    const enrollments = s.studentCourses ?? [];
+    const totalFee = enrollments.reduce(
+      (sum, sc) => sum + Number(sc.course?.fee ?? 0),
+      0,
+    );
+    const totalPaid = enrollments.reduce(
+      (sum, sc) =>
+        sum +
+        (sc.payments ?? []).reduce((p, pay) => p + Number(pay.amount), 0),
+      0,
+    );
+    const totalDue = Math.max(0, totalFee - totalPaid);
+    const hasActive = enrollments.length > 0;
+    const status: 'PENDING' | 'PARTIAL' | 'PAID' = !hasActive
+      ? 'PENDING'
+      : totalFee <= 0
+      ? 'PENDING'
+      : totalPaid >= totalFee
+      ? 'PAID'
+      : totalPaid > 0
+      ? 'PARTIAL'
+      : 'PENDING';
+    const coursePaymentStatuses = enrollments.map((sc) => ({
+      studentCourseId: sc.id,
+      courseName: sc.course?.name ?? 'Course',
+      status: sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
+    }));
+    return {
+      ...s,
+      paymentStatus: status,
+      paymentSummary: { totalFee, totalPaid, totalDue },
+      coursePaymentStatuses,
+    };
+  });
+
   return {
     meta: { page, limit, total },
-    data,
+    data: dataWithStatus,
   };
 };
 
@@ -276,7 +319,41 @@ const getStudentByIdFromDB = async (id: string) => {
     },
   });
   if (!student) throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
-  return student;
+
+  // Derive paymentStatus from the persisted StudentCourse.status values.
+  const enrollments = student.studentCourses ?? [];
+  const totalFee = enrollments.reduce(
+    (sum, sc) => sum + Number(sc.course.fee),
+    0,
+  );
+  const totalPaid = enrollments.reduce(
+    (sum, sc) =>
+      sum +
+      (sc.payments ?? []).reduce((p, pay) => p + Number(pay.amount), 0),
+    0,
+  );
+  const totalDue = Math.max(0, totalFee - totalPaid);
+  const hasActive = enrollments.length > 0;
+  const status: 'PENDING' | 'PARTIAL' | 'PAID' = !hasActive
+    ? 'PENDING'
+    : totalFee <= 0
+    ? 'PENDING'
+    : totalPaid >= totalFee
+    ? 'PAID'
+    : totalPaid > 0
+    ? 'PARTIAL'
+    : 'PENDING';
+  const coursePaymentStatuses = enrollments.map((sc) => ({
+    studentCourseId: sc.id,
+    courseName: sc.course.name,
+    status: sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
+  }));
+  return {
+    ...student,
+    paymentStatus: status,
+    paymentSummary: { totalFee, totalPaid, totalDue },
+    coursePaymentStatuses,
+  };
 };
 
 const updateStudentInDB = async (id: string, payload: TUpdateStudent['body'], user: JwtPayload) => {

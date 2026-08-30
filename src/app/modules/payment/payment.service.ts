@@ -43,6 +43,32 @@ const recordPaymentToDB = async (payload: TRecordPayment, user: JwtPayload) => {
       },
     });
 
+    // Recompute and persist the StudentCourse.status based on the new total
+    // paid vs the course fee. Paid → PAID, some paid → PARTIAL, none → PENDING.
+    if (payment.studentCourseId) {
+      const enrollment = await tx.studentCourse.findUnique({
+        where: { id: payment.studentCourseId },
+        include: { course: true, payments: { where: { isDeleted: false } } },
+      });
+      if (enrollment) {
+        const fee = Number(enrollment.course.fee);
+        const totalPaid = enrollment.payments.reduce(
+          (sum, p) => sum + Number(p.amount),
+          0,
+        );
+        const status: 'PENDING' | 'PARTIAL' | 'PAID' =
+          totalPaid >= fee
+            ? 'PAID'
+            : totalPaid > 0
+            ? 'PARTIAL'
+            : 'PENDING';
+        await tx.studentCourse.update({
+          where: { id: enrollment.id },
+          data: { status },
+        });
+      }
+    }
+
     await tx.activityLog.create({
       data: {
         actorId: user.userId,
