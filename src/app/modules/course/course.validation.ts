@@ -13,6 +13,11 @@ const batchTimeRegex = /^(0?[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$/i;
 
 const batchDaySchema = z
   .object({
+    // Optional id — when provided during an update, the service uses it to
+    // match the incoming row to an existing BatchDay and update it in place,
+    // preserving any foreign-key references (e.g. StudentBatch.batchDayId).
+    // When omitted, a new BatchDay row is created.
+    id: z.string().uuid().optional(),
     name: z.string().trim().min(1, 'Batch day name is required').max(50),
     days: z.array(z.string().trim().min(1)).min(1, 'At least one day is required'),
     times: z

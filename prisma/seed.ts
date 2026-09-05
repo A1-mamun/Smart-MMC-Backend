@@ -9,7 +9,7 @@ async function main() {
   const config = {
     superAdminName: process.env.SUPER_ADMIN_NAME || 'Super Admin',
     superAdminStudentId: process.env.SUPER_ADMIN_STUDENT_ID || 'SMC-ADMIN-001',
-    superAdminPassword: process.env.SUPER_ADMIN_PASSWORD || 'Demo@123!',
+    superAdminPassword: process.env.SUPER_ADMIN_PASSWORD || 'Demo@123',
     bcryptRounds: Number(process.env.BCRYPT_SALT_ROUNDS) || 12,
   };
 

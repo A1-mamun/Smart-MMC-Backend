@@ -180,23 +180,82 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
 
     /*
      * Replace existing batch days
+     *
+     * Preserve BatchDay ids (and the StudentBatch.batchDayId foreign keys
+     * that point at them) by upserting in place instead of deleting the
+     * whole list and recreating it:
+     *
+     *   - Incoming row with an `id` that matches an existing row for this
+     *     course → update it (FKs stay attached).
+     *   - Incoming row without an `id` → create it.
+     *   - Existing rows whose `id` is NOT in the incoming list → delete
+     *     them (these are rows the user removed). Any StudentBatch still
+     *     pointing at one of these has its `batchDayId` set to NULL by the
+     *     schema's `onDelete: SetNull` rule.
      */
     if (payload.batchDays) {
-      await tx.batchDay.deleteMany({
-        where: {
-          courseId: id,
-        },
+      const existingDays = await tx.batchDay.findMany({
+        where: { courseId: id },
+        select: { id: true, name: true },
       });
+      const existingById = new Map(existingDays.map((d) => [d.id, d]));
+      const existingIds = new Set(existingDays.map((d) => d.id));
+      const incomingIds = new Set(
+        payload.batchDays.map((d) => d.id).filter((dId): dId is string => typeof dId === 'string'),
+      );
 
-      await tx.batchDay.createMany({
-        data: payload.batchDays.map((day, position) => ({
-          courseId: id,
+      for (const [position, day] of payload.batchDays.entries()) {
+        const dayData = {
           name: day.name,
           days: day.days,
           times: day.times,
           position,
-        })),
-      });
+        };
+        if (day.id && existingById.has(day.id)) {
+          // Matched — update in place so StudentBatch.batchDayId FKs are preserved.
+          await tx.batchDay.update({
+            where: { id: day.id },
+            data: dayData,
+          });
+
+          /*
+           * Propagate the (potentially renamed) BatchDay name to every
+           * StudentBatch row that points at it. StudentBatch stores the
+           * name denormalized (see admission flow in student.service),
+           * so a rename without this propagation would leave students'
+           * batch labels stale until the next admission edit. Done in the
+           * same transaction so we never half-update.
+           */
+          const previous = existingById.get(day.id);
+          const previousName = previous?.name ?? null;
+          if (previousName !== day.name) {
+            await tx.studentBatch.updateMany({
+              where: { batchDayId: day.id, isDeleted: false },
+              data: { batchDay: day.name },
+            });
+          }
+        } else {
+          // No matching id (or id not provided) — create a new row.
+          // If a stray id was sent that doesn't belong to this course, we
+          // silently ignore it rather than throw, to keep the endpoint
+          // forgiving for stale forms.
+          await tx.batchDay.create({
+            data: {
+              courseId: id,
+              ...dayData,
+            },
+          });
+        }
+      }
+
+      // Delete only the rows the user actually removed. Orphaned
+      // StudentBatch.batchDayId values are set to NULL via `onDelete: SetNull`.
+      const orphanIds = [...existingIds].filter((dId) => !incomingIds.has(dId));
+      if (orphanIds.length > 0) {
+        await tx.batchDay.deleteMany({
+          where: { id: { in: orphanIds } },
+        });
+      }
     }
 
     return tx.course.findUnique({
