@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 const paymentMethods = ['CASH', 'BKASH', 'NAGAD', 'BANK', 'OTHER'] as const;
+const paymentStatuses = ['PENDING', 'PARTIAL', 'PAID'] as const;
 
 const recordPaymentSchema = z.object({
   body: z.object({
@@ -13,6 +14,16 @@ const recordPaymentSchema = z.object({
     note: z.string().max(500).optional(),
     paidAt: z.coerce.date().optional(),
     dueDate: z.coerce.date().optional(),
+    /*
+     * Optional status override for the resulting StudentCourse record.
+     * When omitted, the service keeps its current auto-tracking behavior:
+     *   paid === fee → PAID, paid > 0 → PARTIAL, paid === 0 → PENDING.
+     * When provided, the chosen status is applied verbatim (e.g. staff can
+     * mark a partial payment as PAID for reporting).
+     * Only affects the StudentCourse.status — the Payment.amount itself
+     * remains unchanged so bookkeeping stays honest.
+     */
+    overrideStatus: z.enum(paymentStatuses).optional(),
   }),
 });
 

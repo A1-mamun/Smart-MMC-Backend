@@ -45,23 +45,30 @@ const recordPaymentToDB = async (payload: TRecordPayment, user: JwtPayload) => {
 
     // Recompute and persist the StudentCourse.status based on the new total
     // paid vs the course fee. Paid → PAID, some paid → PARTIAL, none → PENDING.
+    // If the caller passed an overrideStatus we apply it verbatim instead —
+    // the Payment.amount itself is unchanged so the math is still honest.
     if (payment.studentCourseId) {
       const enrollment = await tx.studentCourse.findUnique({
         where: { id: payment.studentCourseId },
         include: { course: true, payments: { where: { isDeleted: false } } },
       });
       if (enrollment) {
-        const fee = Number(enrollment.course.fee);
-        const totalPaid = enrollment.payments.reduce(
-          (sum, p) => sum + Number(p.amount),
-          0,
-        );
-        const status: 'PENDING' | 'PARTIAL' | 'PAID' =
-          totalPaid >= fee
-            ? 'PAID'
-            : totalPaid > 0
-            ? 'PARTIAL'
-            : 'PENDING';
+        let status: 'PENDING' | 'PARTIAL' | 'PAID';
+        if (payload.overrideStatus) {
+          status = payload.overrideStatus;
+        } else {
+          const fee = Number(enrollment.course.fee);
+          const totalPaid = enrollment.payments.reduce(
+            (sum, p) => sum + Number(p.amount),
+            0,
+          );
+          status =
+            totalPaid >= fee
+              ? 'PAID'
+              : totalPaid > 0
+              ? 'PARTIAL'
+              : 'PENDING';
+        }
         await tx.studentCourse.update({
           where: { id: enrollment.id },
           data: { status },
@@ -175,8 +182,16 @@ const getDuePaymentsFromDB = async () => {
       const paid = e.payments.reduce((s, p) => s + Number(p.amount), 0);
       const fee = Number(e.course.fee);
       const due = fee - paid;
+      // Persisted enrollment status (PAID/PARTIAL/PENDING). Honors manual
+      // overrides recorded via the record-payment overrideStatus field.
+      const persistedStatus = e.status as 'PENDING' | 'PARTIAL' | 'PAID';
       return {
         studentId: e.studentId,
+        // The StudentCourse id is what the RecordPaymentModal needs to bind
+        // a payment to a specific enrollment (we look up by enrollment id,
+        // not course id, so a student enrolled in two batches of the same
+        // course still gets the right one preselected).
+        studentCourseId: e.id,
         studentName: e.student.user.name,
         studentUserId: e.student.user.studentId,
         courseId: e.courseId,
@@ -185,9 +200,19 @@ const getDuePaymentsFromDB = async () => {
         paid,
         due: Math.max(0, due),
         isFullyPaid: due <= 0,
+        // Surface the persisted enrollment status so callers can also
+        // filter client-side if they need to.
+        status: persistedStatus,
       };
     })
-    .filter((r) => r.due > 0);
+    /*
+     * Filter to "actually owes money" using either the persisted
+     * StudentCourse.status (respects manual overrides) OR the computed
+     * amount due. An enrollment manually marked PAID drops out even when
+     * `fee - paid` is still positive; a not-yet-paid enrollment drops
+     * out only when the amount has actually been settled in the table.
+     */
+    .filter((r) => r.status !== 'PAID' && r.due > 0);
 
   const totalDueAmount = dueRecords.reduce((s, r) => s + r.due, 0);
 

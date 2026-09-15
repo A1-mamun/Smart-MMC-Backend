@@ -255,9 +255,12 @@ const getAllStudentsFromDB = async (
   ]);
 
   // Derive a per-student paymentStatus from the persisted StudentCourse.status
-  // values. A student with no active enrollments is PENDING. If every active
-  // enrollment is PAID, the student is PAID. If any is PARTIAL and none is
-  // PAID, the student is PARTIAL. Otherwise PENDING.
+  // values (NOT from a recomputation against fee/payments), so manual status
+  // overrides — both historical and from the override-status field on
+  // record-payment — are respected. A student with no active enrollments
+  // is PENDING. If every active enrollment is PAID, the student is PAID. If
+  // any is PARTIAL (and none is PAID), the student is PARTIAL. Otherwise
+  // PENDING. This mirrors the dashboard's bucketing rules.
   const dataWithStatus = data.map((s) => {
     const enrollments = s.studentCourses ?? [];
     const totalFee = enrollments.reduce(
@@ -271,16 +274,17 @@ const getAllStudentsFromDB = async (
       0,
     );
     const totalDue = Math.max(0, totalFee - totalPaid);
-    const hasActive = enrollments.length > 0;
-    const status: 'PENDING' | 'PARTIAL' | 'PAID' = !hasActive
-      ? 'PENDING'
-      : totalFee <= 0
-      ? 'PENDING'
-      : totalPaid >= totalFee
-      ? 'PAID'
-      : totalPaid > 0
-      ? 'PARTIAL'
-      : 'PENDING';
+    const activeStatuses = enrollments.map(
+      (sc) => sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
+    );
+    const status: 'PENDING' | 'PARTIAL' | 'PAID' =
+      activeStatuses.length === 0
+        ? 'PENDING'
+        : activeStatuses.every((st) => st === 'PAID')
+        ? 'PAID'
+        : activeStatuses.some((st) => st === 'PARTIAL')
+        ? 'PARTIAL'
+        : 'PENDING';
     const coursePaymentStatuses = enrollments.map((sc) => ({
       studentCourseId: sc.id,
       courseName: sc.course?.name ?? 'Course',
@@ -320,7 +324,10 @@ const getStudentByIdFromDB = async (id: string) => {
   });
   if (!student) throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
 
-  // Derive paymentStatus from the persisted StudentCourse.status values.
+  // Derive paymentStatus from the persisted StudentCourse.status values
+  // (NOT from a recomputation against fee/payments) so manual status
+  // overrides are reflected. See getAllStudentsFromDB for the full
+  // bucketing rules.
   const enrollments = student.studentCourses ?? [];
   const totalFee = enrollments.reduce(
     (sum, sc) => sum + Number(sc.course.fee),
@@ -333,16 +340,17 @@ const getStudentByIdFromDB = async (id: string) => {
     0,
   );
   const totalDue = Math.max(0, totalFee - totalPaid);
-  const hasActive = enrollments.length > 0;
-  const status: 'PENDING' | 'PARTIAL' | 'PAID' = !hasActive
-    ? 'PENDING'
-    : totalFee <= 0
-    ? 'PENDING'
-    : totalPaid >= totalFee
-    ? 'PAID'
-    : totalPaid > 0
-    ? 'PARTIAL'
-    : 'PENDING';
+  const activeStatuses = enrollments.map(
+    (sc) => sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
+  );
+  const status: 'PENDING' | 'PARTIAL' | 'PAID' =
+    activeStatuses.length === 0
+      ? 'PENDING'
+      : activeStatuses.every((st) => st === 'PAID')
+      ? 'PAID'
+      : activeStatuses.some((st) => st === 'PARTIAL')
+      ? 'PARTIAL'
+      : 'PENDING';
   const coursePaymentStatuses = enrollments.map((sc) => ({
     studentCourseId: sc.id,
     courseName: sc.course.name,
