@@ -28,6 +28,13 @@ export const clearStudentCache = async () => {
 export const clearCourseCache = async () => {
   await clearCacheByPattern('cache:/api/v1/course*');
   await clearCacheByPattern('cache:/api/v1/student-course*');
+  // A course update can rename a BatchDay, which is propagated into
+  // StudentBatch.batchDay. The student list / student-detail / dashboard
+  // / stats endpoints all surface batch day labels, so we evict their
+  // Redis caches here as well so the next read returns fresh data.
+  await clearCacheByPattern('cache:/api/v1/student*');
+  await clearCacheByPattern('cache:/api/v1/dashboard*');
+  await clearCacheByPattern('cache:/api/v1/stats*');
 };
 
 export const clearPaymentCache = async () => {
