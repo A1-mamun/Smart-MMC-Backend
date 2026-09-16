@@ -85,6 +85,32 @@ const getAdminDashboardDataFromDB = async () => {
     }
   }
 
+  /*
+   * Total Due Amount — sum of (fee − paid) across every active enrollment
+   * whose persisted status is NOT PAID. This honors manual overrides
+   * (an enrollment manually marked PAID drops out even if fee − paid > 0)
+   * and is the number the institute should still chase.
+   */
+  const dueEnrollments = await prisma.studentCourse.findMany({
+    where: {
+      isDeleted: false,
+      student: { isDeleted: false },
+      status: { not: PaymentStatus.PAID },
+    },
+    select: {
+      course: { select: { fee: true } },
+      payments: {
+        where: { isDeleted: false },
+        select: { amount: true },
+      },
+    },
+  });
+  const totalDueAmount = dueEnrollments.reduce((sum, e) => {
+    const fee = Number(e.course.fee);
+    const paid = e.payments.reduce((p, pay) => p + Number(pay.amount), 0);
+    return sum + Math.max(0, fee - paid);
+  }, 0);
+
   return {
     cards: {
       totalStudents,
@@ -94,6 +120,7 @@ const getAdminDashboardDataFromDB = async () => {
       overdueRecords: overdueAgg,
       collectedThisMonth: Number(paymentsThisMonthAgg._sum.amount || 0),
       collectedAllTime: Number(paymentsAllTimeAgg._sum.amount || 0),
+      totalDueAmount,
       todayAttendance,
       monthAttendance,
     },
