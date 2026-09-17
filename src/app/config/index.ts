@@ -19,4 +19,9 @@ export default {
   nodemailerPass: process.env.NODEMAILER_PASS,
   deviceSecret: process.env.DEVICE_SECRET,
   buildVersion: process.env.BUILD_VERSION || '1',
+  // BulkSMSBD.net gateway credentials. Defaults to empty so dev mode
+  // never accidentally sends a real SMS.
+  bulkSmsApiKey: process.env.BULK_SMS_API_KEY || '',
+  bulkSmsSenderId: process.env.BULK_SMS_SENDER_ID || '',
+  bulkSmsBaseUrl: process.env.BULK_SMS_BASE_URL || 'http://bulksmsbd.net/api',
 };

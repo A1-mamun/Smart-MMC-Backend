@@ -99,8 +99,26 @@ const getAllStudentsSchema = z.object({
     batchDayId: z.string().uuid().optional(),
     batchTime: z.string().optional(),
     district: z.string().optional(),
+    // SMS scenario filters — all additive (AND-combined) with the filters
+    // above. `classDate` is an ISO date; we resolve it to a weekday name
+    // server-side and match against BatchDay.days[]. `classTime` narrows
+    // the match to a single time slot (e.g. "3:00 PM"). `scenarioCourses`
+    // is a CSV of course UUIDs used by the bulk-SMS "course-wise" picker.
+    // `hasDue` / `activeCoursesOnly` are the dedicated "due payments" and
+    // "active courses" scenarios.
+    classDate: z.coerce.date().optional(),
+    classTime: z.string().optional(),
+    scenarioCourses: z.string().optional(),
+    hasDue: z.coerce.boolean().optional(),
+    activeCoursesOnly: z.coerce.boolean().optional(),
     page: z.coerce.number().int().min(1).optional(),
-    limit: z.coerce.number().int().min(1).max(100).optional(),
+    // Cap raised to 1000 so the bulk-SMS picker can pull the entire cohort
+    // in a single request (it intentionally bypasses pagination — see
+    // `RecipientsPicker.tsx`). 100 is too low: with ~10 students today the
+    // picker is fine, but the picker renders 0 results once any single
+    // cohort grows past that, because the backend rejects the request
+    // outright as "limit too big".
+    limit: z.coerce.number().int().min(1).max(1000).optional(),
     sortBy: z.string().optional(),
     sortOrder: z.enum(['asc', 'desc']).optional(),
   }),

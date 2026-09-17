@@ -71,6 +71,17 @@ enum PaymentStatus {
   PAID
 }
 
+enum SmsLogStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum SmsSendMode {
+  ONE_TO_ONE
+  ONE_TO_MANY
+}
+
 enum AttendanceMethod {
   NFC
   MANUAL
@@ -99,6 +110,7 @@ model User {
   passwordResets    PasswordResetRequest[]
   admittedStudents  Student[]          @relation("AdmittedBy")
   collectedPayments Payment[]          @relation("CollectedBy")
+  smsLogs           SmsLog[]           @relation("SmsSentBy")
 
   @@index([studentId])
   @@index([role])
@@ -333,4 +345,23 @@ model PasswordResetRequest {
   @@index([userId])
   @@index([token])
   @@map("password_reset_requests")
+}
+
+model SmsLog {
+  id           String        @id @default(uuid())
+  recipients   String        // CSV of normalised international numbers, e.g. "8801712345678,8801812345678"
+  message      String
+  status       SmsLogStatus  @default(PENDING)
+  upstreamCode String?
+  errorMsg     String?
+  count        Int           @default(0)
+  mode         SmsSendMode
+  sentById     String
+  sentBy       User          @relation("SmsSentBy", fields: [sentById], references: [id], onDelete: Restrict)
+  createdAt    DateTime      @default(now())
+
+  @@index([sentById])
+  @@index([status])
+  @@index([createdAt])
+  @@map("sms_logs")
 }

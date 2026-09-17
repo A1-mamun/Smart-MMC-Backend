@@ -11,6 +11,29 @@ import calculatePagination from '../../utils/calculatePagination';
 import { clearStudentCache } from '../../utils/clearCache';
 import { JwtPayload } from 'jsonwebtoken';
 
+/**
+ * Convert a Date to the English weekday name (`Sunday` … `Saturday`) that
+ * `BatchDay.days[]` is expected to contain. The check-batch-conflict util
+ * stores the raw user-entered string (case-preserving), so we lowercase
+ * the comparison on the call site — this helper just normalises the JS
+ * output for direct array membership tests.
+ */
+const weekdayNameFor = (d: Date): string =>
+  ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][
+    d.getDay()
+  ];
+
+/**
+ * Treat truthy query values uniformly. The validateRequest middleware
+ * only validates the parsed Zod result and discards it, so the raw
+ * URL-encoded string ("true" / "1") reaches the service even though the
+ * schema's *output* type is `boolean`. Compare against the common truthy
+ * shapes here so scenario toggles like `hasDue` and `activeCoursesOnly`
+ * actually take effect.
+ */
+const isTruthyQuery = (v: unknown): boolean =>
+  v === true || v === 'true' || v === '1' || v === 1;
+
 const studentInclude = {
   user: {
     select: {
@@ -172,8 +195,26 @@ const getAllStudentsFromDB = async (
   options: { page?: number; limit?: number; sortBy?: string; sortOrder?: 'asc' | 'desc' },
 ) => {
   const { page, limit, skip, sortBy, sortOrder } = calculatePagination(options);
-  const { searchTerm, hscBatch, courseId, batchDay, batchDayId, batchTime, district, ...rest } =
-    filters;
+  // Pull every known query key out of `filters` so the SMS scenario keys
+  // (classDate, classTime, scenarioCourses, hasDue, activeCoursesOnly) and
+  // the legacy fields don't leak into `rest` and end up passed to Prisma
+  // as raw `where: { classDate: "..." }` clauses — Prisma rejects unknown
+  // argument names with "Unknown argument `classDate`".
+  const {
+    searchTerm,
+    hscBatch,
+    courseId,
+    batchDay,
+    batchDayId,
+    batchTime,
+    district,
+    classDate,
+    classTime,
+    scenarioCourses,
+    hasDue,
+    activeCoursesOnly,
+    ...rest
+  } = filters;
 
   // console.log('filters:', filters);
   // console.log('options:', options);
@@ -223,6 +264,90 @@ const getAllStudentsFromDB = async (
     if (batchDay) batchWhere.batchDay = batchDay;
     if (batchTime) batchWhere.batchTime = batchTime;
     andConditions.push({ batches: { some: batchWhere } });
+  }
+
+  // ---------------------------------------------------------------------
+  // SMS scenario filters. All four are additive with the existing filter
+  // chain — combining them with the rest is what produces e.g. "students
+  // who have class on Saturday AND have an unpaid enrollment AND are in
+  // HSC 1st Year".
+  // ---------------------------------------------------------------------
+
+  // (a) Class-date + optional class-time → resolve to a list of BatchDay
+  //     rows whose `days[]` contains the chosen weekday (case-insensitive).
+  //     When `classTime` is supplied we further intersect with rows whose
+  //     `times[]` contains that slot. We fetch matching BatchDay ids first
+  //     then filter students by `StudentBatch.batchDayId IN (...)`. Empty
+  //     match is short-circuited via `id: { in: [] }`.
+  if (classDate) {
+    // `classDate` reaches us as the raw string from req.query because the
+    // validateRequest middleware only validates and discards the parsed
+    // result. Coerce here so weekdayNameFor (which calls .getDay()) doesn't
+    // crash with "d.getDay is not a function" when the frontend passes an
+    // ISO yyyy-mm-dd string.
+    const classDateObj =
+      classDate instanceof Date ? classDate : new Date(classDate);
+    const weekday = weekdayNameFor(classDateObj);
+    const matchingBatchDays = await prisma.batchDay.findMany({
+      where: {
+        days: { has: weekday },
+        ...(classTime ? { times: { has: classTime } } : {}),
+        course: { isDeleted: false },
+      },
+      select: { id: true, days: true },
+    });
+    // Re-filter manually for case-insensitive match (Prisma's `has` is
+    // exact equality on Postgres text-array elements).
+    const lowerWeekday = weekday.toLowerCase();
+    const ids = matchingBatchDays
+      .filter((b) => b.days.some((d) => d.toLowerCase() === lowerWeekday))
+      .map((b) => b.id);
+    if (ids.length === 0) {
+      andConditions.push({ id: { in: [] } });
+    } else {
+      andConditions.push({
+        batches: { some: { batchDayId: { in: ids }, isDeleted: false } },
+      });
+    }
+  }
+
+  // (b) Multi-course scenario. CSV of UUIDs → studentCourses matches any.
+  //     Overrides the single `courseId` filter when both are present, since
+  //     a user explicitly selecting "1st + 2nd year" should ignore any
+  //     single-course filter.
+  if (scenarioCourses) {
+    const ids = scenarioCourses
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (ids.length > 0) {
+      andConditions.push({
+        studentCourses: { some: { courseId: { in: ids }, isDeleted: false } },
+      });
+    }
+  }
+
+  // (c) Has-due filter (StudentCourse.status != PAID). Mirrors the rule
+  //     used by `getDuePaymentsFromDB` so the SMS picker and the Due
+  //     Payments page agree on what "due" means.
+  if (isTruthyQuery(hasDue)) {
+    andConditions.push({
+      studentCourses: {
+        some: { isDeleted: false, status: { not: 'PAID' } },
+      },
+    });
+  }
+
+  // (d) Active-courses-only filter.
+  if (isTruthyQuery(activeCoursesOnly)) {
+    andConditions.push({
+      studentCourses: {
+        some: {
+          isDeleted: false,
+          course: { isActive: true, isDeleted: false },
+        },
+      },
+    });
   }
 
   if (district) {
