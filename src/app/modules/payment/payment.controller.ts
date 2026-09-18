@@ -39,8 +39,14 @@ const getAllPayments = catchAsync(async (req, res) => {
   });
 });
 
-const getDuePayments = catchAsync(async (_req, res) => {
-  const result = await PaymentService.getDuePaymentsFromDB();
+const getDuePayments = catchAsync(async (req, res) => {
+  // `validateRequest` middleware (now wired on this route below) parses
+  // and trims `req.query.searchTerm`, so the value reaching us is either
+  // a non-empty trimmed string or undefined. We pass the full query
+  // shape through to the service, which casts it to TGetDuePayments.
+  const result = await PaymentService.getDuePaymentsFromDB(
+    req.query as Parameters<typeof PaymentService.getDuePaymentsFromDB>[0],
+  );
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,

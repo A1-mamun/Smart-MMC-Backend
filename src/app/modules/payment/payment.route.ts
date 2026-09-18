@@ -28,6 +28,7 @@ router.get(
 router.get(
   '/due',
   Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
+  validateRequest(PaymentValidation.getDuePaymentsSchema),
   cache(60),
   PaymentController.getDuePayments,
 );

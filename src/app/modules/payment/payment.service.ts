@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
-import { TRecordPayment, TUpdatePayment, TGetAllPayments } from './payment.validation';
+import { TRecordPayment, TUpdatePayment, TGetAllPayments, TGetDuePayments } from './payment.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearPaymentCache } from '../../utils/clearCache';
 
@@ -118,6 +118,38 @@ const getAllPaymentsFromDB = async (filters: TGetAllPayments) => {
     where.studentCourse = { courseId: filters.courseId };
   }
 
+  // Free-text search: match student name, BD-code, or mobile. `name` and
+  // `studentId` live on `User` (the auth record), `mobile` is on Student.
+  // All three are reachable via a single `student.user` traversal.
+  //
+  // We can't simply set `where.student = { OR: [...] }` when `courseId`
+  // is also set — that would create two relation paths into the Student
+  // model (one from `Payment.student`, one from
+  // `Payment.studentCourse.student`), which Prisma doesn't allow without
+  // explicit AND-merging. When `courseId` is set we nest the search under
+  // `studentCourse.student` so the filter stays on a single relation
+  // path; otherwise we put the search at the top-level `student` slot.
+  //
+  // `mode: 'insensitive'` is mapped to Postgres `ILIKE` by Prisma.
+  if (filters.searchTerm) {
+    const searchFilter: Prisma.PaymentWhereInput['student'] = {
+      OR: [
+        { user: { name: { contains: filters.searchTerm, mode: 'insensitive' } } },
+        { user: { studentId: { contains: filters.searchTerm, mode: 'insensitive' } } },
+        { mobile: { contains: filters.searchTerm, mode: 'insensitive' } },
+      ],
+    };
+    if (where.studentCourse) {
+      // Nest the search filter alongside `courseId` so it ANDs with it.
+      where.studentCourse = {
+        ...((where.studentCourse as object) ?? {}),
+        student: searchFilter,
+      } as Prisma.PaymentWhereInput['studentCourse'];
+    } else {
+      where.student = searchFilter;
+    }
+  }
+
   const orderBy: Prisma.PaymentOrderByWithRelationInput = sortBy
     ? ({ [sortBy]: sortOrder } as Prisma.PaymentOrderByWithRelationInput)
     : { createdAt: 'desc' };
@@ -167,7 +199,7 @@ const getStudentPaymentsFromDB = async (studentId: string) => {
   return { payments, summary };
 };
 
-const getDuePaymentsFromDB = async () => {
+const getDuePaymentsFromDB = async (filters: TGetDuePayments = {}) => {
   const enrollments = await prisma.studentCourse.findMany({
     where: { isDeleted: false },
     include: {
@@ -194,6 +226,10 @@ const getDuePaymentsFromDB = async () => {
         studentCourseId: e.id,
         studentName: e.student.user.name,
         studentUserId: e.student.user.studentId,
+        // Surface the student's mobile so the frontend search can match
+        // it (consistent with /payment's search dimensions). Was not
+        // previously exposed because the original Due tab had no search.
+        studentMobile: e.student.mobile,
         courseId: e.courseId,
         courseName: e.course.name,
         totalFee: fee,
@@ -214,12 +250,38 @@ const getDuePaymentsFromDB = async () => {
      */
     .filter((r) => r.status !== 'PAID' && r.due > 0);
 
-  const totalDueAmount = dueRecords.reduce((s, r) => s + r.due, 0);
+  // Free-text search over name, BD-code, and mobile. Comparing in memory
+  // here is fine — the in-memory `dueRecords` list is already bounded by
+  // the cohort size (one row per enrollment) and the toLowerCase pass is
+  // O(n). Pushing this to a SQL `WHERE` would require restructuring the
+  // existing map+filter pipeline (the per-enrollment computation reads
+  // `payments[]` to derive `due`).
+  //
+  // The case-insensitive comparison matches `getAllPaymentsFromDB`'s
+  // `mode: 'insensitive'` behaviour so the two tabs' search affordances
+  // feel identical to admins.
+  const filtered = filters.searchTerm
+    ? dueRecords.filter((r) => {
+        const q = filters.searchTerm!.toLowerCase();
+        return (
+          r.studentName.toLowerCase().includes(q) ||
+          r.studentUserId.toLowerCase().includes(q) ||
+          r.studentMobile.toLowerCase().includes(q)
+        );
+      })
+    : dueRecords;
+
+  const totalDueAmount = filtered.reduce((s, r) => s + r.due, 0);
 
   return {
-    records: dueRecords,
+    records: filtered,
     summary: {
-      totalDueStudents: new Set(dueRecords.map((r) => r.studentId)).size,
+      // Count of distinct students *in the filtered result*, not the
+      // full unfiltered list. This matches what the admin sees on
+      // screen and avoids the "shows 30, but only 5 are visible"
+      // discrepancy the previous behaviour would produce once search
+      // was added.
+      totalDueStudents: new Set(filtered.map((r) => r.studentId)).size,
       totalDueAmount,
     },
   };

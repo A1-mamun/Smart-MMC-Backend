@@ -12,6 +12,7 @@ const getAllActivities = catchAsync(async (req, res) => {
     'entityType',
     'startDate',
     'endDate',
+    'searchTerm',
   ]);
   const paginationOptions = pick(
     req.query as Record<string, unknown>,

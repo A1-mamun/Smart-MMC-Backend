@@ -48,6 +48,12 @@ const getAllPaymentsSchema = z.object({
     startDate: z.coerce.date().optional(),
     endDate: z.coerce.date().optional(),
     paid: z.coerce.boolean().optional(),
+    // Free-text search across student name, student ID (BD-code), and
+    // mobile. Case-insensitive `contains` matches live on Student/User
+    // rows via the existing Prisma `where.student` relation. Empty
+    // strings are rejected by the min(1) check so callers can pass
+    // `searchTerm: ''` safely through clients that always send the field.
+    searchTerm: z.string().trim().min(1).max(100).optional(),
     page: z.coerce.number().int().min(1).optional(),
     limit: z.coerce.number().int().min(1).max(100).optional(),
     sortBy: z.string().optional(),
@@ -63,10 +69,24 @@ const studentIdParamSchema = z.object({
   params: z.object({ studentId: z.string().uuid() }),
 });
 
+// `/payment/due` accepts a single optional search term that filters the
+// resulting records after the service computes them. Same matching
+// strategy as `getAllPaymentsSchema.searchTerm` (student name, BD-code,
+// mobile) so the two tabs behave consistently — the service does the
+// case-insensitive comparison in-memory because the records list is
+// already resolved at this point (the existing `enrollments.map(...)`
+// pattern returns materialized rows).
+const getDuePaymentsSchema = z.object({
+  query: z.object({
+    searchTerm: z.string().trim().min(1).max(100).optional(),
+  }),
+});
+
 export const PaymentValidation = {
   recordPaymentSchema,
   updatePaymentSchema,
   getAllPaymentsSchema,
+  getDuePaymentsSchema,
   idParamSchema,
   studentIdParamSchema,
 };
@@ -74,3 +94,4 @@ export const PaymentValidation = {
 export type TRecordPayment = z.infer<typeof recordPaymentSchema>['body'];
 export type TUpdatePayment = z.infer<typeof updatePaymentSchema>;
 export type TGetAllPayments = z.infer<typeof getAllPaymentsSchema>['query'];
+export type TGetDuePayments = z.infer<typeof getDuePaymentsSchema>['query'];
