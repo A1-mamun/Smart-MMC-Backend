@@ -10,6 +10,7 @@ import { DashboardRoutes } from '../modules/dashboard/dashboard.route';
 import { ActivityLogRoutes } from '../modules/activityLog/activityLog.route';
 import { StatsRoutes } from '../modules/stats/stats.route';
 import { SmsRoutes } from '../modules/sms/sms.route';
+import { ExamRoutes } from '../modules/exam/exam.route';
 
 const router = Router();
 
@@ -25,6 +26,7 @@ const moduleRoutes = [
   { path: '/activity-log', route: ActivityLogRoutes },
   { path: '/stats', route: StatsRoutes },
   { path: '/sms', route: SmsRoutes },
+  { path: '/exam', route: ExamRoutes },
 ];
 
 moduleRoutes.forEach((r) => router.use(r.path, r.route));

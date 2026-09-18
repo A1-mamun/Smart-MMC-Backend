@@ -88,6 +88,11 @@ enum AttendanceMethod {
   ADMIN
 }
 
+enum ExamSectionType {
+  MCQ
+  WRITTEN
+}
+
 model User {
   id                 String     @id @default(uuid())
   studentId          String     @unique
@@ -111,6 +116,9 @@ model User {
   admittedStudents  Student[]          @relation("AdmittedBy")
   collectedPayments Payment[]          @relation("CollectedBy")
   smsLogs           SmsLog[]           @relation("SmsSentBy")
+  examsCreated      Exam[]             @relation("ExamCreatedBy")
+  examsPublished    Exam[]             @relation("ExamPublishedBy")
+  examResultsUpdated ExamResult[]      @relation("ExamResultUpdatedBy")
 
   @@index([studentId])
   @@index([role])
@@ -153,6 +161,7 @@ model Student {
   batches       StudentBatch[]
   payments      Payment[]
   attendance    Attendance[]
+  examResults   ExamResult[]
 
   @@index([mobile])
   @@index([addressDistrict])
@@ -175,6 +184,7 @@ model Course {
 
   studentCourses StudentCourse[]
   batchDays      BatchDay[]
+  exams          Exam[]
 
   @@index([isActive])
   @@index([isDeleted])
@@ -364,4 +374,99 @@ model SmsLog {
   @@index([status])
   @@index([createdAt])
   @@map("sms_logs")
+}
+
+model Exam {
+  id                String         @id @default(uuid())
+  title             String         @db.VarChar(200)
+  syllabus          String         @db.Text
+  examDate          DateTime       @db.Date
+  courseId          String
+  totalMarks        Int            // denormalised: sum of ExamSection.totalMarks
+  isResultPublished Boolean        @default(false)
+  publishedAt       DateTime?
+  publishedById     String?
+  createdById       String
+  createdBy         User           @relation("ExamCreatedBy",    fields: [createdById],   references: [id], onDelete: Restrict)
+  publishedBy       User?          @relation("ExamPublishedBy",  fields: [publishedById], references: [id], onDelete: SetNull)
+  course            Course         @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  sections          ExamSection[]
+  results           ExamResult[]
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@index([courseId])
+  @@index([examDate])
+  @@index([isResultPublished])
+  @@map("exams")
+}
+
+model ExamSection {
+  id               String         @id @default(uuid())
+  examId           String
+  exam             Exam           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  type             ExamSectionType
+  name             String         @db.VarChar(80)   // "MCQ" | "Srijonsil" | "BUET" | ...
+  totalQuestions   Int
+  marksPerQuestion Decimal        @db.Decimal(6, 2)
+  totalMarks       Int            // totalQuestions * marksPerQuestion (computed at write)
+  position         Int            @default(0)
+  resultSections   ExamResultSection[]
+
+  @@unique([examId, name])
+  @@index([examId])
+  @@map("exam_sections")
+}
+
+model ExamResult {
+  id             String         @id @default(uuid())
+  examId         String
+  exam           Exam           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  studentId      String
+  student        Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  // Default ABSENT. Attendance is recorded on the day of the exam via the
+  // barcode scanner or manual toggle on the Examinees tab. We do NOT
+  // pre-mark anyone present at exam creation — even if a student is on the
+  // roster, they haven't physically shown up yet.
+  isAbsent       Boolean        @default(true)
+  obtainedMarks  Int            @default(0)        // denormalised: sum of ExamResultSection.obtainedMarks
+  // Tracks whether the admin has actually opened the Results tab and
+  // explicitly saved marks for this student. We use it as the gating
+  // signal for `Publish results` — `obtainedMarks > 0` alone isn't enough
+  // because a student who attended and scored 0 in every section also
+  // needs to count as "entered". `marksEntered` is flipped true by
+  // `upsertResultToDB` whenever the saved payload contains at least one
+  // non-default signal (any non-zero section mark, correctAnswers, notes,
+  // or a non-empty remarks). Reset to false when the student is marked
+  // ABSENT in `setAttendanceToDB`.
+  marksEntered   Boolean        @default(false)
+  rank           Int?                              // computed on publish (null until then)
+  remarks        String?        @db.VarChar(500)
+  updatedById    String?
+  updatedBy      User?          @relation("ExamResultUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  sections       ExamResultSection[]
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@unique([examId, studentId])
+  @@index([examId])
+  @@index([studentId])
+  @@index([obtainedMarks])
+  @@map("exam_results")
+}
+
+model ExamResultSection {
+  id             String         @id @default(uuid())
+  resultId       String
+  result         ExamResult     @relation(fields: [resultId], references: [id], onDelete: Cascade)
+  sectionId      String
+  section        ExamSection    @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  correctAnswers Int?                                // for MCQ: # of right answers; multiplies by section.marksPerQuestion
+  obtainedMarks  Int            @default(0)
+  notes          String?        @db.VarChar(300)
+
+  @@unique([resultId, sectionId])
+  @@index([resultId])
+  @@index([sectionId])
+  @@map("exam_result_sections")
 }
