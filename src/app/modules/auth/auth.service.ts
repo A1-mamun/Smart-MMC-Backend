@@ -23,12 +23,29 @@ import { clearCache } from '../../utils/clearCache';
 export const authCookieName = 'refreshToken';
 
 const signInUserToDB = async (payload: TLogin) => {
-  const user = await prisma.user.findUnique({
-    where: { studentId: payload.studentId },
+  // Mobile is the new canonical login handle for students; admins (no
+  // mobile on file) and legacy students who never migrated still log
+  // in with their `studentId`. Try mobile first, then studentId. Both
+  // branches need to succeed before we treat the lookup as "not
+  // found".
+  const identifier = (payload.mobile ?? payload.studentId ?? '').trim();
+  if (!identifier) {
+    throw new AppError(httpStatus.BAD_REQUEST, 'Mobile or student ID is required');
+  }
+
+  // Prisma's `findUnique` only accepts fields declared as `@unique` on the
+  // model. The mobile uniqueness lives in a partial unique index
+  // (`WHERE mobile IS NOT NULL AND isDeleted = false`), so we have to
+  // use `findFirst` and re-apply the same filter the index encodes.
+  let user = await prisma.user.findFirst({
+    where: { mobile: identifier, isDeleted: false },
   });
+  if (!user) {
+    user = await prisma.user.findUnique({ where: { studentId: identifier } });
+  }
 
   if (!user) {
-    throw new AppError(httpStatus.NOT_FOUND, 'No user found with this student ID');
+    throw new AppError(httpStatus.NOT_FOUND, 'No account found with this mobile or student ID');
   }
   if (user.isDeleted) {
     throw new AppError(httpStatus.FORBIDDEN, 'This account has been deleted');
@@ -67,6 +84,7 @@ const signInUserToDB = async (payload: TLogin) => {
     user: {
       id: user.id,
       studentId: user.studentId,
+      mobile: user.mobile,
       name: user.name,
       role: user.role,
       mustChangePassword: user.mustChangePassword,
@@ -166,9 +184,20 @@ const changePasswordToDB = async (
 };
 
 const forgotPasswordToDB = async (payload: TForgotPassword) => {
-  const user = await prisma.user.findUnique({
-    where: { studentId: payload.studentId },
+  // Same dual-key resolution as login.
+  const identifier = (payload.mobile ?? payload.studentId ?? '').trim();
+  if (!identifier) {
+    throw new AppError(httpStatus.BAD_REQUEST, 'Mobile or student ID is required');
+  }
+
+  // Mobile lookup goes via `findFirst` because the mobile uniqueness
+  // lives in a partial unique index — see the comment in signInUserToDB.
+  let user = await prisma.user.findFirst({
+    where: { mobile: identifier, isDeleted: false },
   });
+  if (!user) {
+    user = await prisma.user.findUnique({ where: { studentId: identifier } });
+  }
   if (!user) throw new AppError(httpStatus.NOT_FOUND, 'No user found');
 
   const token = generateResetToken();
@@ -184,8 +213,12 @@ const forgotPasswordToDB = async (payload: TForgotPassword) => {
 
   const resetLink = `${config.frontendUrls?.split(',')[0] || 'http://localhost:3000'}/reset-password?token=${token}`;
 
+  // `to` previously took `user.studentId` as a stand-in for an email
+  // address — since real production deployments won't have email on
+  // file for students, fall back to mobile-as-identifier so we don't
+  // accidentally send a "reset" email to a phone-looking string.
   await sendEmail({
-    to: user.studentId,
+    to: user.mobile ?? user.studentId,
     subject: 'Reset your Smart MMC password',
     html: `<p>Hello ${user.name},</p><p>Click the link below to reset your password (valid for 1 hour):</p><p><a href="${resetLink}">${resetLink}</a></p>`,
   }).catch(() => undefined);
@@ -260,6 +293,9 @@ const getAllUsersFromDB = async (
     where.OR = [
       { name: { contains: filters.searchTerm, mode: 'insensitive' } },
       { studentId: { contains: filters.searchTerm, mode: 'insensitive' } },
+      // Mobile also matches the admin search so a super admin can look
+      // up an admin by their phone number as well.
+      { mobile: { contains: filters.searchTerm, mode: 'insensitive' } },
     ];
   }
 
@@ -274,6 +310,7 @@ const getAllUsersFromDB = async (
         studentId: true,
         name: true,
         nickname: true,
+        mobile: true,
         role: true,
         status: true,
         mustChangePassword: true,
@@ -297,13 +334,55 @@ const getUserByIdFromDB = async (id: string) => {
   return user;
 };
 
+/**
+ * Mint the next free `SMC-ADMIN-NNN` user ID by scanning the existing
+ * rows for the largest numeric suffix and adding 1. Used by
+ * `createUserToDB` so the super admin never has to pick a free slot
+ * manually — collisions are prevented by retrying on the (extremely
+ * rare) duplicate-key error from the unique index on `studentId`.
+ *
+ * The `raw` findMany + reduce beats a SQL `MAX(...)` here because:
+ *  - the table is small (only admins), so pulling every SMC-ADMIN-*
+ *    row is trivial;
+ *  - the regex split keeps the implementation DB-agnostic and easy to
+ *    reason about;
+ *  - we still wrap the read+create in a $transaction below so two
+ *    concurrent admins can't both pick the same slot.
+ */
+const generateNextAdminStudentId = async (
+  tx: Pick<typeof prisma, 'user'>,
+): Promise<string> => {
+  // Pull every candidate row in one go. `findMany` doesn't expose a
+  // SQL `LIKE`-style filter directly without `mode: 'insensitive'`
+  // which would slow the scan; we use `startsWith` which translates
+  // to `LIKE 'SMC-ADMIN-%'` and is fast on the studentId index.
+  const rows = await tx.user.findMany({
+    where: { studentId: { startsWith: 'SMC-ADMIN-' } },
+    select: { studentId: true },
+  });
+  let max = 0;
+  for (const row of rows) {
+    const suffix = row.studentId.slice('SMC-ADMIN-'.length);
+    const n = Number.parseInt(suffix, 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  const next = max + 1;
+  return `SMC-ADMIN-${String(next).padStart(3, '0')}`;
+};
+
 const updateUserInDB = async (
   id: string,
-  payload: { name?: string; studentId?: string; password?: string },
+  payload: { name?: string; password?: string; mobile?: string | null },
 ) => {
   const data: Record<string, unknown> = {};
   if (payload.name) data.name = payload.name;
-  if (payload.studentId) data.studentId = payload.studentId;
+  // The validation schema turns `""` into `null` so the admin can
+  // explicitly clear the mobile. We only write when the key was
+  // actually present in the payload — `undefined` means "don't touch",
+  // anything else (including `null`) means "set it to this".
+  if ('mobile' in payload) {
+    data.mobile = payload.mobile === undefined ? null : payload.mobile;
+  }
   if (payload.password) {
     data.password = await bcrypt.hash(
       payload.password,
@@ -327,26 +406,65 @@ const deleteUserFromDB = async (id: string, deletedBy: string) => {
 };
 
 const createUserToDB = async (payload: {
-  studentId: string;
   name: string;
   password: string;
   role: 'SUPER_ADMIN' | 'ADMIN' | 'STUDENT';
+  mobile?: string;
 }) => {
   const hashed = await bcrypt.hash(
     payload.password,
     Number(config.bcryptSaltRounds) || 12,
   );
-  return prisma.user.create({
-    data: {
-      studentId: payload.studentId,
-      name: payload.name,
-      password: hashed,
-      role: payload.role,
-      mustChangePassword: false,
-      passwordLevel: 1,
-      passwordChangedAt: new Date(),
-    },
-  });
+
+  // Student creation still passes a `studentId` (computed by the admit
+  // flow); the user-management flow doesn't, so we mint the next
+  // `SMC-ADMIN-NNN` here. If two admins race and pick the same slot,
+  // the unique index on `User.studentId` rejects the second insert —
+  // retry up to a few times before surfacing the error.
+  if (payload.role === 'STUDENT') {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      'Students are created via the admit-student flow, not the user-management endpoint',
+    );
+  }
+
+  const MAX_ATTEMPTS = 5;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const studentId = await generateNextAdminStudentId(tx);
+        return tx.user.create({
+          data: {
+            studentId,
+            name: payload.name,
+            password: hashed,
+            role: payload.role,
+            mobile: payload.mobile || null,
+            mustChangePassword: false,
+            passwordLevel: 1,
+            passwordChangedAt: new Date(),
+          },
+        });
+      });
+    } catch (err) {
+      // P2002 = unique constraint violation. Only retry if it's the
+      // studentId column; everything else bubbles up immediately.
+      const code = (err as { code?: string }).code;
+      const target = (err as { meta?: { target?: string[] } }).meta?.target;
+      const isStudentIdClash =
+        code === 'P2002' && Array.isArray(target) && target.includes('studentId');
+      if (!isStudentIdClash) throw err;
+      lastError = err;
+    }
+  }
+  throw (
+    lastError ??
+    new AppError(
+      httpStatus.INTERNAL_SERVER_ERROR,
+      'Failed to allocate a unique admin user ID',
+    )
+  );
 };
 
 export const AuthService = {

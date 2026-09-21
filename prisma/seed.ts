@@ -7,22 +7,35 @@ type DayName = string;
 
 async function main() {
   const config = {
-    superAdminName: process.env.SUPER_ADMIN_NAME || 'Super Admin',
-    superAdminStudentId: process.env.SUPER_ADMIN_STUDENT_ID || 'SMC-ADMIN-001',
-    superAdminPassword: process.env.SUPER_ADMIN_PASSWORD || 'Demo@123',
-    bcryptRounds: Number(process.env.BCRYPT_SALT_ROUNDS) || 12,
+    superAdminName: process.env?.SUPER_ADMIN_NAME,
+    superAdminPhone: process.env.SUPER_ADMIN_PHONE,
+    superAdminStudentId: process.env.SUPER_ADMIN_STUDENT_ID,
+    superAdminPassword: process.env.SUPER_ADMIN_PASSWORD,
+    bcryptRounds: Number(process.env.BCRYPT_SALT_ROUNDS),
   };
 
+  const superAdminStudentId = config.superAdminStudentId;
+  if (!superAdminStudentId) {
+    throw new Error('SUPER_ADMIN_STUDENT_ID is required');
+  }
+
   const superAdminExists = await prisma.user.findUnique({
-    where: { studentId: config.superAdminStudentId },
+    where: { studentId: superAdminStudentId },
   });
 
   if (!superAdminExists) {
     console.log('Creating Super Admin...');
+    if (!config.superAdminName) {
+      throw new Error('SUPER_ADMIN_NAME is required');
+    }
+    if (!config.superAdminPassword) {
+      throw new Error('SUPER_ADMIN_PASSWORD is required');
+    }
+
     const hashed = await bcrypt.hash(config.superAdminPassword, config.bcryptRounds);
     await prisma.user.create({
       data: {
-        studentId: config.superAdminStudentId,
+        studentId: superAdminStudentId,
         name: config.superAdminName,
         password: hashed,
         role: 'SUPER_ADMIN',

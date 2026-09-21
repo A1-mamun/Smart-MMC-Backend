@@ -41,21 +41,40 @@ const admitStudentSchema = z.object({
     nickname: z.string().max(50).optional(),
     college: z.string().max(200).optional(),
     mobile: z.string().regex(phoneRegex, 'Invalid BD mobile number'),
-    bloodGroup: z.enum(bloodGroups),
+    // Optional — admins frequently admit students without yet having
+    // blood-group info on file.
+    bloodGroup: z.enum(bloodGroups).optional().nullable(),
+    // Father block: required (name + occupation + mobile).
     fatherName: z.string().min(2).max(100),
     fatherOccupation: z.string().min(2).max(100),
     fatherMobile: z.string().regex(phoneRegex, 'Invalid BD mobile number'),
-    motherName: z.string().min(2).max(100),
-    motherOccupation: z.string().min(2).max(100),
-    motherMobile: z.string().regex(phoneRegex, 'Invalid BD mobile number'),
-    addressVillage: z.string().min(1).max(200),
-    addressPostOffice: z.string().min(1).max(100),
+    // Mother block: optional — single-parent / missing-info households.
+    motherName: z.string().min(2).max(100).optional().nullable(),
+    motherOccupation: z.string().max(100).optional().nullable(),
+    motherMobile: z
+      .string()
+      .regex(phoneRegex, 'Invalid BD mobile number')
+      .optional()
+      .nullable()
+      .or(z.literal('')),
+    // Address: only Upazila + District are required. Village / Post Office
+    // are common to be unknown at admit time (urban students especially).
+    addressVillage: z.string().max(200).optional().nullable().or(z.literal('')),
+    addressPostOffice: z.string().max(100).optional().nullable().or(z.literal('')),
     addressUpozila: z.string().min(1).max(100),
     addressDistrict: z.string().min(1).max(100),
+    // SSC: institute required; board / year / GPA often filled in later
+    // once the student brings their certificate / testimonial.
     sscInstitute: z.string().min(1).max(200),
-    sscBoard: z.enum(boards),
-    sscPassingYear: z.coerce.number().int().min(2010).max(new Date().getFullYear()),
-    sscGpa: z.coerce.number().min(0).max(5),
+    sscBoard: z.enum(boards).optional().nullable(),
+    sscPassingYear: z.coerce
+      .number()
+      .int()
+      .min(2010)
+      .max(new Date().getFullYear())
+      .optional()
+      .nullable(),
+    sscGpa: z.coerce.number().min(0).max(5).optional().nullable(),
     courseId: z.string().uuid('Select a course'),
     batchDayId: z.string().uuid('Select a batch day'),
     batchTime: z
@@ -65,27 +84,57 @@ const admitStudentSchema = z.object({
   }),
 });
 
+/**
+ * Schema for enrolling an EXISTING student (matched by mobile) into a
+ * NEW course. Strict subset of the admit schema — only the fields that
+ * actually drive the reuse flow. The student profile (User/Student
+ * rows) is matched on `mobile` and otherwise untouched.
+ */
+const enrollExistingStudentSchema = z.object({
+  body: z.object({
+    mobile: z.string().regex(phoneRegex, 'Invalid BD mobile number'),
+    courseId: z.string().uuid('Select a course'),
+    batchDayId: z.string().uuid('Select a batch day'),
+    batchTime: z
+      .string()
+      .trim()
+      .regex(batchTimeRegex, 'Time must be in "h:mm AM/PM" format (e.g. 7:00 AM)'),
+    // Optional nickname fix-up — admins occasionally want to correct a
+    // typo without going through the full edit-student flow.
+    nickname: z.string().trim().min(1).max(50).optional(),
+  }),
+});
+
 const updateStudentSchema = z.object({
   body: z.object({
     name: z.string().min(2).max(100).optional(),
     nickname: z.string().max(50).optional(),
     college: z.string().max(200).optional(),
     mobile: z.string().regex(phoneRegex).optional(),
-    bloodGroup: z.enum(bloodGroups).optional(),
+    // Same relaxations as admit — keep the edit form in sync.
+    bloodGroup: z.enum(bloodGroups).optional().nullable(),
+    // Father block: still required-when-present (min(2) stays so an empty
+    // string cannot clear the field, which would orphan the relationship).
     fatherName: z.string().min(2).max(100).optional(),
     fatherOccupation: z.string().min(2).max(100).optional(),
     fatherMobile: z.string().regex(phoneRegex).optional(),
-    motherName: z.string().min(2).max(100).optional(),
-    motherOccupation: z.string().min(2).max(100).optional(),
-    motherMobile: z.string().regex(phoneRegex).optional(),
-    addressVillage: z.string().min(1).max(200).optional(),
-    addressPostOffice: z.string().min(1).max(100).optional(),
+    motherName: z.string().min(2).max(100).optional().nullable(),
+    motherOccupation: z.string().max(100).optional().nullable(),
+    motherMobile: z.string().regex(phoneRegex).optional().nullable().or(z.literal('')),
+    addressVillage: z.string().max(200).optional().nullable().or(z.literal('')),
+    addressPostOffice: z.string().max(100).optional().nullable().or(z.literal('')),
     addressUpozila: z.string().min(1).max(100).optional(),
     addressDistrict: z.string().min(1).max(100).optional(),
     sscInstitute: z.string().min(1).max(200).optional(),
-    sscBoard: z.enum(boards).optional(),
-    sscPassingYear: z.coerce.number().int().min(2010).max(new Date().getFullYear()).optional(),
-    sscGpa: z.coerce.number().min(0).max(5).optional(),
+    sscBoard: z.enum(boards).optional().nullable(),
+    sscPassingYear: z.coerce
+      .number()
+      .int()
+      .min(2010)
+      .max(new Date().getFullYear())
+      .optional()
+      .nullable(),
+    sscGpa: z.coerce.number().min(0).max(5).optional().nullable(),
   }),
   params: z.object({ id: z.string().uuid() }),
 });
@@ -135,6 +184,7 @@ const deleteStudentSchema = z.object({
 
 export const StudentValidation = {
   admitStudentSchema,
+  enrollExistingStudentSchema,
   updateStudentSchema,
   getAllStudentsSchema,
   idParamSchema,
@@ -142,5 +192,8 @@ export const StudentValidation = {
 };
 
 export type TAdmitStudent = z.infer<typeof admitStudentSchema>['body'];
+export type TEnrollExistingStudentValidation = z.infer<
+  typeof enrollExistingStudentSchema
+>['body'];
 export type TUpdateStudent = z.infer<typeof updateStudentSchema>;
 export type TGetAllStudents = z.infer<typeof getAllStudentsSchema>['query'];

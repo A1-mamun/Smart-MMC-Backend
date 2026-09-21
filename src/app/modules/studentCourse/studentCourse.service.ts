@@ -5,6 +5,7 @@ import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
 import { TEnroll } from './studentCourse.validation';
 import { clearCourseCache } from '../../utils/clearCache';
+import generateStudentId from '../../utils/generateStudentId';
 
 const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
   const student = await prisma.student.findUnique({ where: { id: payload.studentId } });
@@ -27,6 +28,12 @@ const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
     throw new AppError(httpStatus.CONFLICT, 'Student already enrolled in this course');
   }
 
+  // Generate a fresh per-enrollment Student ID using the target course's
+  // hscBatch + name. Same generator used at admit time — the roll is
+  // global per (hscBatch, yearDigit) prefix so two enrollments in two
+  // courses with different year-digits get distinct IDs.
+  const newStudentCourseId = await generateStudentId(course.hscBatch, course.name);
+
   const result = await prisma.$transaction(async (tx) => {
     let enrollment;
     if (exists) {
@@ -38,6 +45,10 @@ const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
           deletedBy: null,
           enrolledBy: user.userId,
           enrolledAt: new Date(),
+          // Preserve any pre-existing per-enrollment ID; otherwise
+          // (re-enrolling a previously un-enrolled row) stamp the
+          // freshly generated one.
+          studentCourseId: exists.studentCourseId ?? newStudentCourseId,
         },
         include: { course: true },
       });
@@ -47,6 +58,7 @@ const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
           studentId: payload.studentId,
           courseId: payload.courseId,
           enrolledBy: user.userId,
+          studentCourseId: newStudentCourseId,
         },
         include: { course: true },
       });
@@ -60,7 +72,11 @@ const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
         entityType: 'StudentCourse',
         entityId: enrollment.id,
         description: `Student enrolled in "${course.name}"`,
-        metadata: { studentId: payload.studentId, courseId: payload.courseId },
+        metadata: {
+          studentId: payload.studentId,
+          courseId: payload.courseId,
+          studentCourseId: enrollment.studentCourseId,
+        },
       },
     });
 
@@ -123,6 +139,9 @@ const getStudentCoursesFromDB = async (studentId: string) => {
     );
     return {
       id: enrollment.id,
+      // Per-enrollment Student ID — distinct from User.studentId so a
+      // student enrolled in two courses has two different IDs.
+      studentCourseId: enrollment.studentCourseId,
       course: enrollment.course,
       enrolledAt: enrollment.enrolledAt,
       isCompleted: enrollment.isCompleted,

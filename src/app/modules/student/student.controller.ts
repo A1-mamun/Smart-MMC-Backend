@@ -12,12 +12,45 @@ const admitStudent = catchAsync(async (req, res) => {
   sendResponse(res, {
     statusCode: httpStatus.CREATED,
     success: true,
-    message: 'Student admitted successfully',
+    // Different message depending on whether we created a new profile
+    // or added a course to an existing one — the admit form surfaces
+    // the appropriate success copy from this string.
+    message: result.alreadyEnrolled
+      ? `Existing student added to the new course (${result.studentCourseId})`
+      : 'Student admitted successfully',
     data: {
       student: result.student,
       credentials: {
         studentId: result.studentId,
+        // null when the profile already existed — no new login creds.
         initialPassword: result.initialPassword,
+        studentCourseId: result.studentCourseId,
+        alreadyEnrolled: result.alreadyEnrolled,
+      },
+    },
+  });
+});
+
+const enrollExistingStudent = catchAsync(async (req, res) => {
+  const result = await StudentService.enrollExistingStudentToDB(
+    req.body,
+    req.user as JwtPayload,
+  );
+  sendResponse(res, {
+    statusCode: httpStatus.CREATED,
+    success: true,
+    // Same success copy the admit endpoint uses when it detects an
+    // existing student — the credentials card on the frontend renders
+    // identically regardless of which endpoint produced the response.
+    message: `Existing student added to the new course (${result.studentCourseId})`,
+    data: {
+      student: result.student,
+      credentials: {
+        studentId: result.studentId,
+        // null when reusing the profile — no new login creds minted.
+        initialPassword: result.initialPassword,
+        studentCourseId: result.studentCourseId,
+        alreadyEnrolled: result.alreadyEnrolled,
       },
     },
   });
@@ -90,6 +123,7 @@ const getMyProfile = catchAsync(async (req, res) => {
 
 export const StudentController = {
   admitStudent,
+  enrollExistingStudent,
   getAllStudents,
   getStudentById,
   updateStudent,
