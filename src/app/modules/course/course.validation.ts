@@ -52,6 +52,7 @@ const updateCourseSchema = z.object({
     hscBatch: z.enum(hscBatches).optional(),
     batchDays: z.array(batchDaySchema).min(1).max(7).optional(),
     isActive: z.boolean().optional(),
+    isCompleted: z.boolean().optional(),
   }),
   params: z.object({ id: z.string().uuid() }),
 });
@@ -59,6 +60,7 @@ const updateCourseSchema = z.object({
 const getAllCoursesSchema = z.object({
   query: z.object({
     isActive: z.union([z.boolean(), z.string()]).optional(),
+    isCompleted: z.union([z.boolean(), z.string()]).optional(),
     searchTerm: z.string().optional(),
     page: z.coerce.number().int().min(1).optional(),
     limit: z.coerce.number().int().min(1).max(100).optional(),
@@ -76,15 +78,27 @@ const toggleActiveSchema = z.object({
   body: z.object({ isActive: z.boolean() }),
 });
 
+const markCompletedSchema = z.object({
+  params: z.object({ id: z.string().uuid() }),
+  body: z.object({
+    // Defaults to true; admins can also pass false to "un-complete"
+    // (e.g. toggled by accident). The service stamps completedAt /
+    // completedBy when true, clears them when false.
+    isCompleted: z.boolean().optional().default(true),
+  }),
+});
+
 export const CourseValidation = {
   createCourseSchema,
   updateCourseSchema,
   getAllCoursesSchema,
   idParamSchema,
   toggleActiveSchema,
+  markCompletedSchema,
 };
 
 export type TCreateCourse = z.infer<typeof createCourseSchema>['body'];
 export type TUpdateCourse = z.infer<typeof updateCourseSchema>;
 export type TGetAllCourses = z.infer<typeof getAllCoursesSchema>['query'];
+export type TMarkCompleted = z.infer<typeof markCompletedSchema>;
 export type TBatchDayInput = z.infer<typeof batchDaySchema>;

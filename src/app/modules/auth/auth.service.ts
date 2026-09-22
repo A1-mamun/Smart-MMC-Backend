@@ -4,12 +4,7 @@ import { JwtPayload } from 'jsonwebtoken';
 import config from '../../config';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
-import {
-  TLogin,
-  TChangePassword,
-  TForgotPassword,
-  TResetPassword,
-} from './auth.validation';
+import { TLogin, TChangePassword, TForgotPassword, TResetPassword } from './auth.validation';
 import {
   generateAccessToken,
   generateRefreshToken,
@@ -53,8 +48,9 @@ const signInUserToDB = async (payload: TLogin) => {
   if (user.status === 'BANNED') {
     throw new AppError(httpStatus.FORBIDDEN, 'This account has been banned');
   }
-
+  console.log('User found:', user.studentId, user.name, user.role, user.status);
   const passwordMatch = await bcrypt.compare(payload.password, user.password);
+  console.log('Password match:', passwordMatch);
   if (!passwordMatch) {
     throw new AppError(httpStatus.UNAUTHORIZED, 'Invalid credentials');
   }
@@ -94,10 +90,7 @@ const signInUserToDB = async (payload: TLogin) => {
   };
 };
 
-const refreshTokenToDB = async (
-  tokenFromBody?: string,
-  cookieToken?: string,
-) => {
+const refreshTokenToDB = async (tokenFromBody?: string, cookieToken?: string) => {
   const token = tokenFromBody || cookieToken;
   if (!token) throw new AppError(httpStatus.UNAUTHORIZED, 'No refresh token');
 
@@ -140,10 +133,7 @@ const logoutFromDB = async (cookieToken?: string) => {
   return null;
 };
 
-const changePasswordToDB = async (
-  userId: string,
-  payload: TChangePassword,
-) => {
+const changePasswordToDB = async (userId: string, payload: TChangePassword) => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw new AppError(httpStatus.NOT_FOUND, 'User not found');
 
@@ -160,10 +150,7 @@ const changePasswordToDB = async (
     );
   }
 
-  const newHashed = await bcrypt.hash(
-    payload.newPassword,
-    Number(config.bcryptSaltRounds) || 12,
-  );
+  const newHashed = await bcrypt.hash(payload.newPassword, Number(config.bcryptSaltRounds) || 12);
 
   await prisma.user.update({
     where: { id: userId },
@@ -237,10 +224,7 @@ const resetPasswordToDB = async (payload: TResetPassword) => {
   const user = await prisma.user.findUnique({ where: { id: request.userId } });
   if (!user) throw new AppError(httpStatus.NOT_FOUND, 'User not found');
 
-  const newHashed = await bcrypt.hash(
-    payload.newPassword,
-    Number(config.bcryptSaltRounds) || 12,
-  );
+  const newHashed = await bcrypt.hash(payload.newPassword, Number(config.bcryptSaltRounds) || 12);
 
   await prisma.$transaction([
     prisma.user.update({
@@ -349,9 +333,7 @@ const getUserByIdFromDB = async (id: string) => {
  *  - we still wrap the read+create in a $transaction below so two
  *    concurrent admins can't both pick the same slot.
  */
-const generateNextAdminStudentId = async (
-  tx: Pick<typeof prisma, 'user'>,
-): Promise<string> => {
+const generateNextAdminStudentId = async (tx: Pick<typeof prisma, 'user'>): Promise<string> => {
   // Pull every candidate row in one go. `findMany` doesn't expose a
   // SQL `LIKE`-style filter directly without `mode: 'insensitive'`
   // which would slow the scan; we use `startsWith` which translates
@@ -384,10 +366,7 @@ const updateUserInDB = async (
     data.mobile = payload.mobile === undefined ? null : payload.mobile;
   }
   if (payload.password) {
-    data.password = await bcrypt.hash(
-      payload.password,
-      Number(config.bcryptSaltRounds) || 12,
-    );
+    data.password = await bcrypt.hash(payload.password, Number(config.bcryptSaltRounds) || 12);
     data.passwordChangedAt = new Date();
     data.passwordLevel = { increment: 1 };
   }
@@ -411,10 +390,7 @@ const createUserToDB = async (payload: {
   role: 'SUPER_ADMIN' | 'ADMIN' | 'STUDENT';
   mobile?: string;
 }) => {
-  const hashed = await bcrypt.hash(
-    payload.password,
-    Number(config.bcryptSaltRounds) || 12,
-  );
+  const hashed = await bcrypt.hash(payload.password, Number(config.bcryptSaltRounds) || 12);
 
   // Student creation still passes a `studentId` (computed by the admit
   // flow); the user-management flow doesn't, so we mint the next
@@ -460,10 +436,7 @@ const createUserToDB = async (payload: {
   }
   throw (
     lastError ??
-    new AppError(
-      httpStatus.INTERNAL_SERVER_ERROR,
-      'Failed to allocate a unique admin user ID',
-    )
+    new AppError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to allocate a unique admin user ID')
   );
 };
 

@@ -4,6 +4,7 @@ import config from './app/config';
 import prisma from './app/utils/prisma';
 import { connectRedis } from './app/utils/redis';
 import app from './app';
+import { startAllSchedulers } from './app/modules/settings/scheduler';
 
 let server: Server;
 
@@ -20,6 +21,13 @@ async function main() {
   server = app.listen(config.port, () => {
     console.log(`Smart MMC API listening on port ${config.port}`);
   });
+
+  // In-process schedulers. Skips in test env (see scheduler.ts).
+  // Long-running Node hosts (single VPS / container) are the target —
+  // short-lived serverless platforms are explicitly out of scope.
+  // Currently registers the absent-warning weekly cron and the
+  // exam-absence daily cron — both share the same per-minute tick.
+  startAllSchedulers();
 }
 
 main();

@@ -9,30 +9,48 @@ const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{6,}$/;
 const mobileRegex = /^01[3-9]\d{8}$/;
 
 const createUserValidationSchema = z.object({
-  body: z.object({
-    // `studentId` is intentionally NOT accepted from the client for
-    // role=SUPER_ADMIN / ADMIN — those user IDs follow the
-    // `SMC-ADMIN-NNN` sequence and are minted server-side at creation
-    // time so the super admin doesn't have to think about collisions
-    // or pick the next free slot. Students still get their `studentId`
-    // generated via `generateStudentId` at admit time, so this only
-    // affects the user-management flow.
-    name: z.string().min(2).max(100),
-    password: z
-      .string()
-      .min(6)
-      .regex(passwordRegex, 'Weak password'),
-    role: z.enum([USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN, USER_ROLE.STUDENT]),
-    // Optional — admin profiles don't require a phone to exist, but
-    // we want one on file so the admin can use mobile as their login
-    // handle (mirrors students). When provided it has to be a valid
-    // BD mobile; when omitted the column stays NULL.
-    mobile: z
-      .string()
-      .regex(mobileRegex, 'Invalid BD mobile (e.g. 01712345678)')
-      .optional()
-      .or(z.literal('').transform(() => undefined)),
-  }),
+  body: z
+    .object({
+      // `studentId` is intentionally NOT accepted from the client for
+      // role=SUPER_ADMIN / ADMIN — those user IDs follow the
+      // `SMC-ADMIN-NNN` sequence and are minted server-side at creation
+      // time so the super admin doesn't have to think about collisions
+      // or pick the next free slot. Students still get their `studentId`
+      // generated via `generateStudentId` at admit time, so this only
+      // affects the user-management flow.
+      name: z.string().min(2).max(100),
+      password: z
+        .string()
+        .min(6)
+        .regex(passwordRegex, 'Weak password'),
+      role: z.enum([USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN, USER_ROLE.STUDENT]),
+      // Optional at the field level — admins REQUIRE a mobile (see the
+      // superRefine below), other roles can omit it. When provided it
+      // has to be a valid BD mobile; an empty string is normalised to
+      // `undefined` so the column stays NULL.
+      mobile: z
+        .string()
+        .regex(mobileRegex, 'Invalid BD mobile (e.g. 01712345678)')
+        .optional()
+        .or(z.literal('').transform(() => undefined)),
+    })
+    .superRefine((data, ctx) => {
+      // ADMIN users MUST have a mobile on file so they can sign in via
+      // mobile + password (mirrors students). The same applies when a
+      // SUPER_ADMIN is being created through this endpoint — we want a
+      // contact point on every non-student profile. The check is
+      // symmetric and matches what the UI marks as required.
+      if (
+        (data.role === USER_ROLE.ADMIN || data.role === USER_ROLE.SUPER_ADMIN) &&
+        !data.mobile
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['mobile'],
+          message: 'Mobile number is required for admin and super admin accounts',
+        });
+      }
+    }),
 });
 
 const updateUserValidationSchema = z.object({

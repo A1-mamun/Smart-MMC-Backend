@@ -36,6 +36,7 @@ async function main() {
     await prisma.user.create({
       data: {
         studentId: superAdminStudentId,
+        mobile: config.superAdminPhone,
         name: config.superAdminName,
         password: hashed,
         role: 'SUPER_ADMIN',

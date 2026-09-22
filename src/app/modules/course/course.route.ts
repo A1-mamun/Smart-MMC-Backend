@@ -55,4 +55,12 @@ router.patch(
   CourseController.toggleActive,
 );
 
+router.patch(
+  '/:id/mark-completed',
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
+  writeOperationRateLimiter,
+  validateRequest(CourseValidation.markCompletedSchema),
+  CourseController.markCompleted,
+);
+
 export const CourseRoutes = router;

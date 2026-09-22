@@ -15,6 +15,7 @@ import {
   TBulkResults,
   TListExams,
   TGetMyResults,
+  TGetMyUpcomingExams,
 } from './exam.validation';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1239,7 +1240,23 @@ const getMyResultsFromDB = async (studentUserId: string, query: TGetMyResults) =
 
   const student = await prisma.student.findFirst({
     where: { userId: studentUserId, isDeleted: false },
-    select: { id: true },
+    select: {
+      id: true,
+      studentCourses: {
+        where: { isDeleted: false },
+        select: { courseId: true },
+      },
+      examResults: {
+        // We need to know which exams the student is on the roster of.
+        // The where clause here is intentionally broad — any row counts
+        // (ABSENT placeholders from `upsertRoster` are still "I am on
+        // the roster" signals).
+        select: {
+          examId: true,
+          exam: { select: { courseId: true } },
+        },
+      },
+    },
   });
   if (!student) {
     return {
@@ -1248,14 +1265,43 @@ const getMyResultsFromDB = async (studentUserId: string, query: TGetMyResults) =
     };
   }
 
-  const where: Prisma.ExamResultWhereInput = {
-    studentId: student.id,
-    exam: { isResultPublished: true, ...(query.courseId ? { courseId: query.courseId } : {}) },
+  // Build the set of courses the student is "in scope" for, mirroring
+  // `getMyUpcomingExamsFromDB`:
+  //   - every active `StudentCourse.courseId`, OR
+  //   - every course the student has any `ExamResult` row on.
+  const courseIdSet = new Set<string>();
+  for (const sc of student.studentCourses) courseIdSet.add(sc.courseId);
+  for (const er of student.examResults) courseIdSet.add(er.exam.courseId);
+  const eligibleCourseIds = Array.from(courseIdSet);
+
+  // Exams on which the student has a real roster row (i.e. a per-row
+  // `ExamResult` already exists). We use the result row's lifecycle to
+  // look up real marks later.
+  const rosterExamIdSet = new Set(student.examResults.map((er) => er.examId));
+
+  if (eligibleCourseIds.length === 0) {
+    return { data: [], meta: { page, limit, total: 0 } };
+  }
+
+  const courseFilter = query.courseId ? { courseId: query.courseId } : {};
+  const publishedExamWhere = {
+    isResultPublished: true,
+    courseId: { in: eligibleCourseIds },
+    ...courseFilter,
   };
 
-  const [data, total] = await Promise.all([
+  /*
+   * Path A — Published exams where the student HAS a roster row.
+   * Drives real marks / highest / rank.
+   */
+  const rosterWhere: Prisma.ExamResultWhereInput = {
+    studentId: student.id,
+    exam: publishedExamWhere,
+  };
+
+  const [rosterData, rosterTotal] = await Promise.all([
     prisma.examResult.findMany({
-      where,
+      where: rosterWhere,
       skip,
       take: limit,
       orderBy: { exam: { examDate: 'desc' } },
@@ -1266,16 +1312,19 @@ const getMyResultsFromDB = async (studentUserId: string, query: TGetMyResults) =
         sections: { include: { section: true } },
       },
     }),
-    prisma.examResult.count({ where }),
+    prisma.examResult.count({ where: rosterWhere }),
   ]);
 
-  // For each result, compute the highest marks in that exam.
-  const examIds = data.map((d) => d.examId);
+  // For each roster result, compute the highest marks in that exam.
+  const rosterExamIds = rosterData.map((d) => d.examId);
   const highestByExam = new Map<string, number>();
-  if (examIds.length > 0) {
+  if (rosterExamIds.length > 0) {
     const groups = await prisma.examResult.groupBy({
       by: ['examId'],
-      where: { examId: { in: examIds }, isAbsent: false },
+      where: {
+        examId: { in: rosterExamIds },
+        isAbsent: false,
+      },
       _max: { obtainedMarks: true },
     });
     for (const g of groups) {
@@ -1283,24 +1332,267 @@ const getMyResultsFromDB = async (studentUserId: string, query: TGetMyResults) =
     }
   }
 
+  const rosterResults = rosterData.map((r) => ({
+    resultId: r.id,
+    examId: r.examId,
+    examTitle: r.exam.title,
+    examDate: r.exam.examDate,
+    courseId: r.exam.courseId,
+    courseName: r.exam.course.name,
+    totalMarks: r.exam.totalMarks,
+    // Same flag as before — every row here comes from a published exam
+    // (filtered server-side), and the frontend uses it for UI gating.
+    isResultPublished: true as const,
+    // True when this entry corresponds to a real `ExamResult` row. The
+    // complementary synthetic entries (Path B below) carry `false`.
+    hasResultRow: true as const,
+    obtainedMarks: r.obtainedMarks,
+    highestMarks: highestByExam.get(r.examId) ?? 0,
+    rank: r.rank ?? null,
+    sections: r.sections.map((s) => ({
+      sectionId: s.sectionId,
+      name: s.section.name,
+      type: s.section.type,
+      obtainedMarks: s.obtainedMarks,
+      totalMarks: s.section.totalMarks,
+    })),
+  }));
+
+  /*
+   * Path B — Published exams for an eligible course where the student
+   * has NO `ExamResult` row. The student is enrolled in the course so
+   * the exam is "their" exam in spirit; the admin simply hasn't added
+   * them to this exam's roster. Surface a synthetic entry so the
+   * student at least sees the exam on the Previous tab. Marks are
+   * zeroed and `hasResultRow: false` tells the frontend to render an
+   * "Awaiting your marks" notice instead of real numbers.
+   */
+  const rosterPublishedExamIds = new Set(rosterData.map((r) => r.examId));
+  const syntheticWhere: Prisma.ExamWhereInput = {
+    ...publishedExamWhere,
+    id: rosterExamIdSet.size > 0
+      ? { notIn: Array.from(rosterExamIdSet) }
+      : undefined,
+  };
+
+  const [syntheticExams, syntheticTotal] = await Promise.all([
+    prisma.exam.findMany({
+      where: syntheticWhere,
+      skip: 0, // we apply pagination manually below after merging
+      take: limit,
+      orderBy: { examDate: 'desc' },
+      include: {
+        course: { select: { id: true, name: true } },
+        sections: { orderBy: { position: 'asc' } },
+      },
+    }),
+    prisma.exam.count({ where: syntheticWhere }),
+  ]);
+
+  // Synthesise TMyResult-shaped entries for exams the student is
+  // enrolled in but not on the roster of.
+  const syntheticResults = syntheticExams
+    .filter((e) => !rosterPublishedExamIds.has(e.id))
+    .map((e) => ({
+      resultId: e.id, // Echo exam id so the key is unique even without a real result row.
+      examId: e.id,
+      examTitle: e.title,
+      examDate: e.examDate,
+      courseId: e.courseId,
+      courseName: e.course.name,
+      totalMarks: e.totalMarks,
+      isResultPublished: true as const,
+      hasResultRow: false as const,
+      obtainedMarks: 0,
+      highestMarks: 0,
+      rank: null as number | null,
+      sections: e.sections.map((s) => ({
+        sectionId: s.id,
+        name: s.name,
+        type: s.type,
+        obtainedMarks: 0,
+        totalMarks: s.totalMarks,
+      })),
+    }));
+
+  // Merge by exam id (synthetic first, then roster) deduping — the
+  // same exam shouldn't appear twice. `hasResultRow` wins so the
+  // student sees their real numbers whenever possible.
+  const merged = new Map<string, (typeof rosterResults)[number] | (typeof syntheticResults)[number]>();
+  for (const r of syntheticResults) merged.set(r.examId, r);
+  for (const r of rosterResults) merged.set(r.examId, r);
+
+  const all = Array.from(merged.values()).sort(
+    (a, b) => new Date(b.examDate).getTime() - new Date(a.examDate).getTime(),
+  );
+
+  // Apply page/limit on the merged list. `meta.total` reflects the
+  // full set so the client can paginate correctly.
+  const paged = all.slice(skip, skip + limit);
+  const total = rosterTotal + syntheticTotal;
+
   return {
-    data: data.map((r) => ({
-      resultId: r.id,
-      examId: r.examId,
-      examTitle: r.exam.title,
-      examDate: r.exam.examDate,
-      courseId: r.exam.courseId,
-      courseName: r.exam.course.name,
-      totalMarks: r.exam.totalMarks,
-      obtainedMarks: r.obtainedMarks,
-      highestMarks: highestByExam.get(r.examId) ?? 0,
-      rank: r.rank ?? null,
-      sections: r.sections.map((s) => ({
-        sectionId: s.sectionId,
-        name: s.section.name,
-        type: s.section.type,
-        obtainedMarks: s.obtainedMarks,
-        totalMarks: s.section.totalMarks,
+    data: paged,
+    meta: { page, limit, total },
+  };
+};
+
+/**
+ * Upcoming exams for the signed-in student.
+ *
+ * A student is considered "interested" in an exam if EITHER:
+ *   1. They have a non-deleted `StudentCourse` row for that course, OR
+ *   2. They are on the exam's roster (an `ExamResult` row already exists
+ *      for them on that exam).
+ *
+ * Source (2) matters because the exam roster is the source of truth for
+ * who is sitting the exam. A student can be on the roster without an
+ * active enrollment — e.g. their `StudentCourse` was soft-deleted after
+ * they were registered, or the admin added them via `upsertRoster` as a
+ * one-off examinee. Using only `StudentCourse` would miss those students
+ * and leave the Upcoming tab empty in the very case the user reported:
+ * "there is a student of this course as examinee, but the upcoming tab
+ * doesn't show the exam".
+ *
+ * Returns every exam whose `examDate` is today or in the future
+ * (regardless of publish state) so the student panel can surface the
+ * full schedule. Sorted ascending by `examDate` so the soonest exam
+ * is on top.
+ *
+ * Optional `courseId` filter narrows to a single course. `limit` is
+ * capped at 100 to keep the dashboard payload small.
+ */
+const getMyUpcomingExamsFromDB = async (
+  studentUserId: string,
+  query: TGetMyUpcomingExams,
+) => {
+  const { page, limit, skip } = calculatePagination({
+    page: query.page,
+    limit: query.limit ?? 20,
+  });
+
+  const student = await prisma.student.findFirst({
+    where: { userId: studentUserId, isDeleted: false },
+    select: {
+      id: true,
+      studentCourses: {
+        where: { isDeleted: false },
+        select: { courseId: true },
+      },
+      // Exam results — i.e. the student's roster memberships. The
+      // existence of an `ExamResult` row for this student on a given
+      // exam is the canonical "this student is registered for this
+      // exam" signal, regardless of `isAbsent` (the admin flips that
+      // during attendance tracking — it doesn't affect eligibility).
+      examResults: {
+        select: {
+          exam: {
+            select: {
+              courseId: true,
+            },
+          },
+        },
+      },
+    },
+  });
+  if (!student) {
+    return { data: [], meta: { page, limit, total: 0 } };
+  }
+
+  /*
+   * Build the set of courseIds the student should see upcoming exams
+   * for, deduped via a Set.
+   *
+   * `examDate` is stored as `@db.Date`, so the JS Date round-trip puts
+   * the time component at 00:00 UTC. Comparing with a server-local
+   * `setHours(0,0,0,0)` works for non-TZ-sensitive servers but is fragile
+   * in the rare case where the server's TZ puts "today" on the previous
+   * calendar day in UTC. To stay correct across TZ configurations, we
+   * compare in the same calendar-day frame as the database: derive
+   * today's date in the SERVER's local timezone as a YYYY-MM-DD string,
+   * then compare against the JS Date that Prisma materialised from
+   * that exact same column. Both sides share the same TZ semantics, so
+   * an exam whose stored date is `today` will always satisfy
+   * `examDate >= todayDate`.
+   */
+  const courseIdSet = new Set<string>();
+  for (const sc of student.studentCourses) courseIdSet.add(sc.courseId);
+  for (const er of student.examResults) courseIdSet.add(er.exam.courseId);
+
+  if (courseIdSet.size === 0) {
+    return { data: [], meta: { page, limit, total: 0 } };
+  }
+  const eligibleCourseIds = Array.from(courseIdSet);
+
+  const now = new Date();
+  // YYYY-MM-DD derived from local-time components so it lines up with
+  // whatever wall-clock date the admin used when creating the exam.
+  const todayStr =
+    `${now.getFullYear()}-` +
+    `${String(now.getMonth() + 1).padStart(2, '0')}-` +
+    `${String(now.getDate()).padStart(2, '0')}`;
+  // `T00:00:00` (no Z) is interpreted in the SERVER's local timezone by
+  // the Postgres driver, which is exactly what we want — it matches
+  // the wall-clock date we just computed.
+  const todayDate = new Date(`${todayStr}T00:00:00`);
+
+  const where: Prisma.ExamWhereInput = {
+    courseId: { in: eligibleCourseIds },
+    examDate: { gte: todayDate },
+    ...(query.courseId ? { courseId: query.courseId } : {}),
+  };
+
+  const [data, total] = await Promise.all([
+    prisma.exam.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { examDate: 'asc' },
+      include: {
+        course: { select: { id: true, name: true } },
+        // Lightweight section summary so the student details dialog can
+        // render the per-section breakdown (name / type / questions /
+        // per-question marks / total) without a second round-trip. We
+        // intentionally do NOT include any result marks or roster data
+        // here — students should never see other students' marks or
+        // personal details through this endpoint.
+        sections: {
+          orderBy: { position: 'asc' },
+          select: {
+            id: true,
+            type: true,
+            name: true,
+            totalQuestions: true,
+            marksPerQuestion: true,
+            totalMarks: true,
+            position: true,
+          },
+        },
+        _count: { select: { sections: true } },
+      },
+    }),
+    prisma.exam.count({ where }),
+  ]);
+
+  return {
+    data: data.map((e) => ({
+      id: e.id,
+      title: e.title,
+      syllabus: e.syllabus,
+      examDate: e.examDate,
+      isResultPublished: e.isResultPublished,
+      courseId: e.courseId,
+      courseName: e.course.name,
+      totalMarks: e.totalMarks,
+      sectionCount: e._count.sections,
+      sections: e.sections.map((s) => ({
+        id: s.id,
+        type: s.type,
+        name: s.name,
+        totalQuestions: s.totalQuestions,
+        marksPerQuestion: Number(s.marksPerQuestion),
+        totalMarks: s.totalMarks,
+        position: s.position,
       })),
     })),
     meta: { page, limit, total },
@@ -1323,4 +1615,5 @@ export const ExamService = {
   getExamByIdToDB,
   getAllExamsFromDB,
   getMyResultsFromDB,
+  getMyUpcomingExamsFromDB,
 };

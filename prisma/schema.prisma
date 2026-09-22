@@ -100,9 +100,10 @@ model User {
   // phone number. Existing rows are backfilled from the matching
   // Student.mobile during the migration. Admins (no Student profile)
   // keep `mobile` null and continue to log in with their `studentId`
-  // (e.g. SMC-ADMIN-001). The unique index is a partial index so the
-  // many admin rows with NULL mobile don't conflict.
-  mobile             String?
+  // (e.g. SMC-ADMIN-001). The @unique below treats NULL values as
+  // distinct in Postgres, so the many admin rows with NULL mobile
+  // continue to coexist.
+  mobile             String?   @unique
   name               String
   nickname           String?
   password           String
@@ -126,12 +127,13 @@ model User {
   examsCreated      Exam[]             @relation("ExamCreatedBy")
   examsPublished    Exam[]             @relation("ExamPublishedBy")
   examResultsUpdated ExamResult[]      @relation("ExamResultUpdatedBy")
+  settingsUpdated   Setting[]          @relation("SettingUpdatedBy")
+  coursesCompleted  Course[]           @relation("CourseCompletedBy")
 
   @@index([studentId])
   @@index([role])
   @@index([status])
   @@index([isDeleted])
-  @@index([mobile])
   @@map("users")
 }
 
@@ -139,7 +141,12 @@ model Student {
   id              String         @id @default(uuid())
   userId          String         @unique
   college         String?
-  mobile          String
+  // One student profile per phone number — defensive duplicate
+  // safeguard against bad imports or accidental double-admits. The
+  // `enroll-existing` flow reuses an existing Student row by mobile
+  // rather than creating a new one, so this never blocks legitimate
+  // re-admissions.
+  mobile          String         @unique
   bloodGroup      BloodGroup?
   fatherName      String
   fatherOccupation String
@@ -170,8 +177,9 @@ model Student {
   payments      Payment[]
   attendance    Attendance[]
   examResults   ExamResult[]
+  weeklyAbsentWarnings WeeklyAbsentWarning[]
+  examAbsenceWarnings ExamAbsenceWarning[]
 
-  @@index([mobile])
   @@index([addressDistrict])
   @@index([sscPassingYear])
   @@index([admittedBy])
@@ -186,6 +194,18 @@ model Course {
   fee            Decimal    @db.Decimal(10, 2)
   hscBatch       HscBatch   @default(BATCH_27)
   isActive       Boolean    @default(true)
+  // Set by an admin when this batch has graduated / is no longer
+  // running classes. Used as the gate for student re-enrollment: a
+  // student cannot enroll in another course while they have an active
+  // enrollment in a course whose `isCompleted` is false. Independent
+  // of `StudentCourse.isCompleted` (which tracks per-enrollment
+  // course-grade completion and is set automatically by the exam
+  // module).
+  isCompleted    Boolean    @default(false)
+  // Nullable — tracks who and when the admin marked it complete so
+  // the activity-log can reconstruct the lifecycle.
+  completedAt    DateTime?
+  completedBy    String?
   isDeleted      Boolean    @default(false)
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
@@ -193,8 +213,10 @@ model Course {
   studentCourses StudentCourse[]
   batchDays      BatchDay[]
   exams          Exam[]
+  completedByUser User? @relation("CourseCompletedBy", fields: [completedBy], references: [id], onDelete: SetNull)
 
   @@index([isActive])
+  @@index([isCompleted])
   @@index([isDeleted])
   @@index([hscBatch])
   @@map("courses")
@@ -312,6 +334,14 @@ model Attendance {
   method      AttendanceMethod @default(NFC)
   deviceId    String?
   recordedBy  String?
+  // Set only when this row is a "make-up" — the recorded `date` is the
+  // student's dedicated class day in their batch, but they physically
+  // checked in on a peer batch's class day. e.g. a Batch A (Sat/Mon/Wed)
+  // student scans on Sunday (peer Batch B's day) → recorded for Saturday,
+  // this field = Sunday. Null for a regular scan. The unique constraint
+  // on (studentId, date) is unchanged, so a student can still only have
+  // one row per dedicated class day.
+  swapFromDate DateTime?       @db.Date
   createdAt   DateTime         @default(now())
 
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
@@ -320,6 +350,7 @@ model Attendance {
   @@index([studentId])
   @@index([date])
   @@index([method])
+  @@index([swapFromDate])
   @@map("attendance")
 }
 
@@ -386,6 +417,9 @@ model SmsLog {
   sentBy       User          @relation("SmsSentBy", fields: [sentById], references: [id], onDelete: Restrict)
   createdAt    DateTime      @default(now())
 
+  weeklyAbsentWarnings WeeklyAbsentWarning[]
+  examAbsenceWarnings ExamAbsenceWarning[]
+
   @@index([sentById])
   @@index([status])
   @@index([createdAt])
@@ -408,6 +442,7 @@ model Exam {
   course            Course         @relation(fields: [courseId], references: [id], onDelete: Restrict)
   sections          ExamSection[]
   results           ExamResult[]
+  examAbsenceWarnings ExamAbsenceWarning[]
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
 
@@ -485,4 +520,76 @@ model ExamResultSection {
   @@index([resultId])
   @@index([sectionId])
   @@map("exam_result_sections")
+}
+
+// Generic key/value config store. Today the only key in use is
+// `absent_warning_sms` (see settings.service.ts) but the schema is
+// generic so future toggles don't need a migration. `value` is Json
+// so the per-key shape is owned by the consuming service module.
+model Setting {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  value     Json
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  updatedByUser User? @relation("SettingUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@index([updatedBy])
+  @@map("settings")
+}
+
+// Dedupe ledger for the absent-warning feature. One row per
+// (studentId, isoYear, isoWeek) — guarantees the scheduler + manual
+// picker can never warn the same student twice in the same ISO week,
+// matching the user's "maximum one time in a week" requirement. The
+// `absentDate` column preserves which class-day the warning was
+// triggered by for audit purposes.
+model WeeklyAbsentWarning {
+  id           String   @id @default(uuid())
+  studentId    String
+  isoYear      Int
+  isoWeek      Int
+  absentDate   DateTime @db.Date
+  sentToMobile String
+  smsLogId     String?
+  createdAt    DateTime @default(now())
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  smsLog  SmsLog? @relation(fields: [smsLogId], references: [id], onDelete: SetNull)
+
+  @@unique([studentId, isoYear, isoWeek])
+  @@index([isoYear, isoWeek])
+  @@index([absentDate])
+  @@index([smsLogId])
+  @@map("weekly_absent_warnings")
+}
+
+// Dedupe ledger for the exam-absence father-warning feature. One row
+// per (examId, studentId) blocks re-warns for the same exam regardless
+// of how many cron ticks pass after the delay-threshold day. We do NOT
+// scope by week — an examinee can only sit an exam once, so
+// (examId, studentId) is sufficient and the row is reusable across
+// academic years. The `absentDate` echoes Exam.examDate for audit; the
+// `warnedAt` captures the calendar day the SMS actually fired.
+model ExamAbsenceWarning {
+  id            String   @id @default(uuid())
+  examId        String
+  studentId     String
+  absentDate    DateTime @db.Date
+  warnedAt      DateTime @db.Date
+  sentToMobile  String
+  smsLogId      String?
+  createdAt     DateTime @default(now())
+
+  exam    Exam     @relation(fields: [examId],    references: [id], onDelete: Cascade)
+  student Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  smsLog  SmsLog?  @relation(fields: [smsLogId],  references: [id], onDelete: SetNull)
+
+  @@unique([examId, studentId])
+  @@index([examId])
+  @@index([studentId])
+  @@index([warnedAt])
+  @@map("exam_absence_warnings")
 }

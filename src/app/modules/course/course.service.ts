@@ -1,8 +1,15 @@
 import httpStatus from 'http-status';
 import { Prisma } from '@prisma/client';
+import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
-import { TCreateCourse, TUpdateCourse, TGetAllCourses, TBatchDayInput } from './course.validation';
+import {
+  TCreateCourse,
+  TUpdateCourse,
+  TGetAllCourses,
+  TBatchDayInput,
+  TMarkCompleted,
+} from './course.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearCourseCache } from '../../utils/clearCache';
 import { checkBatchTimeConflict } from '../../utils/checkBatchTimeConflict';
@@ -58,6 +65,9 @@ const getAllCoursesFromDB = async (filters: TGetAllCourses) => {
   const where: Prisma.CourseWhereInput = { isDeleted: false };
   if (filters.isActive !== undefined) {
     where.isActive = filters.isActive === 'true' || filters.isActive === true;
+  }
+  if (filters.isCompleted !== undefined) {
+    where.isCompleted = filters.isCompleted === 'true' || filters.isCompleted === true;
   }
   if (filters.searchTerm) {
     where.OR = [
@@ -144,6 +154,21 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
 
   if (payload.isActive !== undefined) {
     data.isActive = payload.isActive;
+  }
+
+  if (payload.isCompleted !== undefined) {
+    // Treat isCompleted as a side-effecting field: when the admin
+    // flips it on, stamp the timestamp so the activity log can
+    // answer "when was this batch marked complete". Flipping it off
+    // clears the timestamp. The actor (`completedBy`) is set via the
+    // dedicated PATCH /:id/mark-completed endpoint only — for the
+    // generic update path we don't have a user in scope.
+    data.isCompleted = payload.isCompleted;
+    if (payload.isCompleted === true) {
+      data.completedAt = new Date();
+    } else if (payload.isCompleted === false) {
+      data.completedAt = null;
+    }
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -281,6 +306,42 @@ const toggleCourseActiveToDB = async (id: string, isActive: boolean) => {
   return updated;
 };
 
+/**
+ * Mark a course batch as completed (or un-complete it). The admin
+ * flow: flip the flag, we stamp the actor + timestamp, and the
+ * enrollment gate in `student.service.ts` immediately starts letting
+ * existing students re-enroll in another course.
+ *
+ * Writing a separate endpoint (instead of just `PATCH /:id` with
+ * `isCompleted`) gives us a single auditable hook for the lifecycle
+ * event, mirrors `PATCH /:id/toggle-active`, and keeps the
+ * general-purpose update endpoint free of timestamp side-effects.
+ */
+const markCourseCompletedToDB = async (
+  id: string,
+  payload: TMarkCompleted['body'],
+  user: JwtPayload,
+) => {
+  const existing = await prisma.course.findUnique({ where: { id } });
+  if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
+
+  const isCompleted = payload.isCompleted ?? true;
+  const updated = await prisma.course.update({
+    where: { id },
+    data: {
+      isCompleted,
+      completedAt: isCompleted ? new Date() : null,
+      // Only stamp the actor when marking complete. Clearing on
+      // un-complete is intentional — the audit trail should reflect
+      // "this is NOT currently considered complete".
+      completedBy: isCompleted ? user.userId : null,
+    },
+    include: { batchDays: { orderBy: { position: 'asc' } } },
+  });
+  await clearCourseCache();
+  return updated;
+};
+
 const deleteCourseFromDB = async (id: string) => {
   await prisma.course.update({
     where: { id },
@@ -296,6 +357,7 @@ export const CourseService = {
   getCourseByIdFromDB,
   updateCourseInDB,
   toggleCourseActiveToDB,
+  markCourseCompletedToDB,
   deleteCourseFromDB,
 };
 

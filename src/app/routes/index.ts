@@ -11,6 +11,8 @@ import { ActivityLogRoutes } from '../modules/activityLog/activityLog.route';
 import { StatsRoutes } from '../modules/stats/stats.route';
 import { SmsRoutes } from '../modules/sms/sms.route';
 import { ExamRoutes } from '../modules/exam/exam.route';
+import { SettingsRoutes } from '../modules/settings/settings.route';
+import { AbsentWarningRoutes } from '../modules/absentWarning/absentWarning.route';
 
 const router = Router();
 
@@ -27,6 +29,8 @@ const moduleRoutes = [
   { path: '/stats', route: StatsRoutes },
   { path: '/sms', route: SmsRoutes },
   { path: '/exam', route: ExamRoutes },
+  { path: '/settings', route: SettingsRoutes },
+  { path: '/absent-warning', route: AbsentWarningRoutes },
 ];
 
 moduleRoutes.forEach((r) => router.use(r.path, r.route));

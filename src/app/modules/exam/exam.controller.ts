@@ -157,6 +157,21 @@ const getMyResults = catchAsync(async (req, res) => {
   });
 });
 
+const getMyUpcomingExams = catchAsync(async (req, res) => {
+  const userId = (req.user as JwtPayload).userId;
+  const result = await ExamService.getMyUpcomingExamsFromDB(
+    userId,
+    req.query as Parameters<typeof ExamService.getMyUpcomingExamsFromDB>[1],
+  );
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Upcoming exams retrieved successfully',
+    meta: result.meta,
+    data: result.data,
+  });
+});
+
 export const ExamController = {
   createExam,
   updateExam,
@@ -169,4 +184,5 @@ export const ExamController = {
   getAllExams,
   getExamById,
   getMyResults,
+  getMyUpcomingExams,
 };

@@ -160,6 +160,12 @@ const getAllStudentsSchema = z.object({
     scenarioCourses: z.string().optional(),
     hasDue: z.coerce.boolean().optional(),
     activeCoursesOnly: z.coerce.boolean().optional(),
+    // ISO yyyy-mm-dd — server resolves to "students enrolled in a
+    // class on this weekday MINUS students with an Attendance row on
+    // this date". Used by the absent-warning SMS picker on
+    // /dashboard/sms. Combines additively with the rest of the
+    // filter chain.
+    absentOnDate: z.coerce.date().optional(),
     page: z.coerce.number().int().min(1).optional(),
     // Cap raised to 1000 so the bulk-SMS picker can pull the entire cohort
     // in a single request (it intentionally bypasses pagination — see

@@ -16,6 +16,11 @@ export const studentFilterableFields = [
   'scenarioCourses',
   'hasDue',
   'activeCoursesOnly',
+  // Absent-warning picker — narrows the cohort to students who were
+  // expected to be in class on this date but have no Attendance row.
+  // Resolved server-side in student.service.ts (see the `absentOnDate`
+  // branch in getAllStudentsFromDB); the value is an ISO yyyy-mm-dd.
+  'absentOnDate',
 ];
 
 export const studentSearchableFields = ['user.name', 'user.nickname', 'user.studentId', 'mobile'];

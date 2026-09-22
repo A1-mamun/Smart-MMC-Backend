@@ -79,6 +79,23 @@ const toggleActive = catchAsync(async (req, res) => {
   });
 });
 
+const markCompleted = catchAsync(async (req, res) => {
+  const result = await CourseService.markCourseCompletedToDB(
+    req.params.id as string,
+    req.body,
+    req.user,
+  );
+  const flag = result.isCompleted;
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: flag
+      ? `Course "${result.name}" marked as completed. Students can now enroll in a new course.`
+      : `Course "${result.name}" re-opened. New enrollments are gated again.`,
+    data: result,
+  });
+});
+
 export const CourseController = {
   createCourse,
   getAllCourses,
@@ -86,4 +103,5 @@ export const CourseController = {
   updateCourse,
   deleteCourse,
   toggleActive,
+  markCompleted,
 };

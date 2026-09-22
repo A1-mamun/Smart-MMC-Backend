@@ -8,13 +8,19 @@ import { writeOperationRateLimiter } from '../../middlewares/rateLimiter';
 
 const router = express.Router();
 
-// IMPORTANT: `/me/results` must come BEFORE `/:id` so Express doesn't match
-// "me" as a UUID parameter.
+// IMPORTANT: `/me/*` routes must come BEFORE `/:id` so Express doesn't match
+// "me" / "upcoming" as a UUID parameter.
 router.get(
   '/me/results',
   Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN, USER_ROLE.STUDENT),
   validateRequest(ExamValidation.getMyResultsSchema),
   ExamController.getMyResults,
+);
+router.get(
+  '/me/upcoming',
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN, USER_ROLE.STUDENT),
+  validateRequest(ExamValidation.getMyUpcomingExamsSchema),
+  ExamController.getMyUpcomingExams,
 );
 
 // List + create

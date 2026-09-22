@@ -115,6 +115,14 @@ const getMyResultsSchema = z.object({
   }),
 });
 
+const getMyUpcomingExamsSchema = z.object({
+  query: z.object({
+    courseId: z.string().uuid().optional(),
+    page: z.coerce.number().int().min(1).optional(),
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+  }),
+});
+
 export const ExamValidation = {
   createExamSchema,
   updateExamSchema,
@@ -127,6 +135,7 @@ export const ExamValidation = {
   listExamsSchema,
   idParamSchema,
   getMyResultsSchema,
+  getMyUpcomingExamsSchema,
 };
 
 export type TCreateExam = z.infer<typeof createExamSchema>['body'];
@@ -141,3 +150,4 @@ export type TUpsertResult = z.infer<typeof upsertResultSchema>['body'];
 export type TBulkResults = z.infer<typeof bulkResultsSchema>['body'];
 export type TListExams = z.infer<typeof listExamsSchema>['query'];
 export type TGetMyResults = z.infer<typeof getMyResultsSchema>['query'];
+export type TGetMyUpcomingExams = z.infer<typeof getMyUpcomingExamsSchema>['query'];

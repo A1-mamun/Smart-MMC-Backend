@@ -1,5 +1,6 @@
 import httpStatus from 'http-status';
 import bcrypt from 'bcrypt';
+import dayjs from 'dayjs';
 import { Prisma } from '@prisma/client';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
@@ -118,6 +119,16 @@ const resolveBatchDayForCourse = async (courseId: string, batchDayId: string, ba
   if (!course.isActive) {
     throw new AppError(httpStatus.BAD_REQUEST, 'Selected course is not active');
   }
+  // A course marked complete by the admin has "graduated" — no new
+  // admits or re-enrollments are allowed. The frontend filters
+  // completed courses out of the picker, but we still guard here so a
+  // stale form payload (cached before the toggle) can't slip through.
+  if (course.isCompleted) {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      'Selected course has been marked as completed and is no longer accepting enrollments. Re-open it from the Courses page first.',
+    );
+  }
 
   const matchingBatchDay = course.batchDays.find((d) => d.id === batchDayId);
   if (!matchingBatchDay) {
@@ -178,6 +189,33 @@ const enrollExistingStudentToDB = async (
     throw new AppError(
       httpStatus.CONFLICT,
       'This student is already enrolled in this course',
+    );
+  }
+
+  // Gate: a student may not enroll in another course while they have
+  // an active enrollment in a course whose batch is not yet marked
+  // complete. Without this, a student could be in HSC_1ST_YEAR and
+  // HSC_2ND_YEAR simultaneously, which is what the user explicitly
+  // wants to forbid ("can enroll another course after finished the
+  // current course"). We surface the blocking course name(s) in the
+  // error so the admin knows exactly which one to mark complete.
+  const blockingEnrollments = await prisma.studentCourse.findMany({
+    where: {
+      studentId: existingStudent.id,
+      isDeleted: false,
+      courseId: { not: course.id },
+      course: { isCompleted: false },
+    },
+    select: { course: { select: { name: true } } },
+  });
+  if (blockingEnrollments.length > 0) {
+    const names = blockingEnrollments
+      .map((e) => e.course.name)
+      .filter((n, i, arr) => arr.indexOf(n) === i) // unique
+      .join(', ');
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      `Cannot enroll: this student still has an active enrollment in ${names}, which has not been marked as completed yet. Mark the course(s) as complete first, then retry.`,
     );
   }
 
@@ -423,6 +461,14 @@ const getAllStudentsFromDB = async (
     scenarioCourses,
     hasDue,
     activeCoursesOnly,
+    absentOnDate,
+    // The absent-warning picker + run-now pass `limit`/`page` inside
+    // `filters` (not just in `options`); strip them so they don't slip
+    // into the WHERE clause as raw where-input keys.
+    page: _pageFromFilters,
+    limit: _limitFromFilters,
+    sortBy: _sortByFromFilters,
+    sortOrder: _sortOrderFromFilters,
     ...rest
   } = filters;
 
@@ -556,6 +602,44 @@ const getAllStudentsFromDB = async (
           isDeleted: false,
           course: { isActive: true, isDeleted: false },
         },
+      },
+    });
+  }
+
+  // (e) Absent-on-date filter — feeds the absent-warning SMS picker.
+  //     Resolves to "expected students on this weekday minus students
+  //     with an Attendance row on this exact date". Implemented in two
+  //     passes because the cohort + present subtraction cross-tables,
+  //     and a single `NOT EXISTS` against `attendance` would fail to
+  //     account for the "expected" half (the student only counts as
+  //     absent if they were enrolled in a class that day).
+  if (absentOnDate) {
+    const targetDate = dayjs(absentOnDate).startOf('day').toDate();
+    const weekday = weekdayNameFor(targetDate);
+    // (e.1) Narrow cohort to students with a batch on this weekday.
+    const matchingBatchDays = await prisma.batchDay.findMany({
+      where: {
+        days: { has: weekday },
+        course: { isDeleted: false },
+      },
+      select: { id: true, days: true },
+    });
+    const lowerWeekday = weekday.toLowerCase();
+    const batchDayIds = matchingBatchDays
+      .filter((b) => b.days.some((d) => d.toLowerCase() === lowerWeekday))
+      .map((b) => b.id);
+    if (batchDayIds.length === 0) {
+      andConditions.push({ id: { in: [] } });
+    } else {
+      andConditions.push({
+        batches: { some: { batchDayId: { in: batchDayIds }, isDeleted: false } },
+      });
+    }
+    // (e.2) Subtract present. We use `NOT` on a where-clause against
+    //       Attendance — Prisma compiles this to a NOT EXISTS subquery.
+    andConditions.push({
+      NOT: {
+        attendance: { some: { date: targetDate } },
       },
     });
   }
