@@ -4,7 +4,6 @@ import { clearCacheByPattern } from '../../utils/clearCache';
 import {
   DEFAULT_ABSENT_WARNING_CONFIG,
   DEFAULT_EXAM_ABSENCE_CONFIG,
-  TAbsentWarningConfig,
   TConfigPatch,
   TExamAbsenceConfig,
   TSettingsConfig,
@@ -53,31 +52,19 @@ const getConfigFromDB = async (): Promise<TSettingsConfig> => {
 };
 
 /**
- * Project a flat PATCH body onto its two sub-configs. The frontend
- * ships a single PUT covering both features; the body uses
- * `examAbsence*` for the new fields and bare names for the existing
- * absent-warning ones. `absentMessage` is accepted as a back-compat
- * alias for `message`.
+ * Project a flat PATCH body onto its (single) sub-config. The
+ * absent-warning feature no longer accepts user edits — its only
+ * sub-config is exam-absence, which is keyed by `examAbsence*` in the
+ * body.
  *
- * Returns `null` for a sub-config that wasn't touched, signalling to the
- * caller that no upsert is needed for that row.
+ * Returns `null` for a sub-config that wasn't touched, signalling to
+ * the caller that no upsert is needed for that row.
  */
 const projectPatch = (
   patch: TConfigPatch,
 ): {
-  absent: Partial<TAbsentWarningConfig> | null;
   exam: Partial<TExamAbsenceConfig> | null;
 } => {
-  const absent: Partial<TAbsentWarningConfig> = {};
-  if (patch.mode !== undefined) absent.mode = patch.mode;
-  if (patch.dayOfWeek !== undefined) absent.dayOfWeek = patch.dayOfWeek;
-  if (patch.hour !== undefined) absent.hour = patch.hour;
-  if (patch.minute !== undefined) absent.minute = patch.minute;
-  if (patch.lookbackDays !== undefined) absent.lookbackDays = patch.lookbackDays;
-  // Both `message` and the legacy `absentMessage` names hit absent-warning.
-  const msg = patch.message ?? patch.absentMessage;
-  if (msg !== undefined) absent.message = msg;
-
   const exam: Partial<TExamAbsenceConfig> = {};
   if (patch.examAbsenceEnabled !== undefined) {
     exam.enabled = patch.examAbsenceEnabled;
@@ -96,7 +83,6 @@ const projectPatch = (
   }
 
   return {
-    absent: Object.keys(absent).length > 0 ? absent : null,
     exam: Object.keys(exam).length > 0 ? exam : null,
   };
 };
@@ -140,21 +126,11 @@ const upsertConfigInDB = async (
   patch: TConfigPatch,
   actor: JwtPayload,
 ): Promise<TSettingsConfig> => {
-  const { absent, exam } = projectPatch(patch);
+  const { exam } = projectPatch(patch);
 
-  // Fan out the patches. We do them sequentially rather than in
-  // `Promise.all` because the same call writes `actor.userId` and we
-  // want ordered activity-log rows when both fire. The cost is one
-  // extra round-trip on the rare "both dirty" save — negligible.
-  if (absent) {
-    await upsertSubConfig(
-      ABSENT_WARNING_CONFIG_KEY,
-      absent,
-      DEFAULT_ABSENT_WARNING_CONFIG,
-      absentWarningConfigSchema,
-      actor,
-    );
-  }
+  // Only the exam-absence sub-config is user-tunable now. The
+  // absent-warning row is read-only (always served from
+  // DEFAULT_ABSENT_WARNING_CONFIG if missing).
   if (exam) {
     await upsertSubConfig(
       EXAM_ABSENCE_CONFIG_KEY,
@@ -168,7 +144,7 @@ const upsertConfigInDB = async (
   // Evict any cached GET /api/v1/settings* so the next read returns
   // fresh data. Cache middleware keys on the URL path, so a broad
   // pattern catches /settings/config and the new /settings/exam-absence/run.
-  if (absent || exam) {
+  if (exam) {
     await clearCacheByPattern('cache:/api/v1/settings*').catch(() => undefined);
   }
 

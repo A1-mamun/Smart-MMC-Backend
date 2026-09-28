@@ -37,6 +37,11 @@ const createCourseSchema = z.object({
     description: z.string().max(500).optional(),
     fee: z.coerce.number().min(0),
     hscBatch: z.enum(hscBatches),
+    // Per-course seat cap. NULL = uncapped. The DB DEFAULT is 120, so
+    // omitting this in a create payload still gets the safe default
+    // server-side. min(1) blocks the "0 seats = nobody allowed" footgun
+    // (use isActive=false for that intent). max(10000) is a sanity cap.
+    totalSeats: z.coerce.number().int().min(1).max(10000).nullable().optional(),
     batchDays: z
       .array(batchDaySchema)
       .min(1, 'At least one batch day is required')
@@ -50,6 +55,7 @@ const updateCourseSchema = z.object({
     description: z.string().max(500).optional(),
     fee: z.coerce.number().min(0).optional(),
     hscBatch: z.enum(hscBatches).optional(),
+    totalSeats: z.coerce.number().int().min(1).max(10000).nullable().optional(),
     batchDays: z.array(batchDaySchema).min(1).max(7).optional(),
     isActive: z.boolean().optional(),
     isCompleted: z.boolean().optional(),

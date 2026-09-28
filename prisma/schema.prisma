@@ -210,6 +210,11 @@ model Course {
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
 
+  // Cap on concurrently-enrolled, non-deleted students. NULL = uncapped
+  // (legacy). Admins edit from the Courses page. Enforced server-side
+  // inside the admit/re-enroll transaction with a SELECT … FOR UPDATE
+  // on the Course row, and mirrored on the frontend admit picker.
+  totalSeats     Int?
   studentCourses StudentCourse[]
   batchDays      BatchDay[]
   exams          Exam[]
@@ -293,6 +298,10 @@ model StudentBatch {
   @@index([hscBatch])
   @@index([studentId])
   @@index([batchDayId])
+  // Hot path for the per-slot seat-cap gate in
+  // resolveBatchDayForCourse and the GET /course/:id/seats aggregation.
+  // Cheap to maintain because StudentBatch rows are append-mostly.
+  @@index([batchDayId, batchTime])
   @@map("student_batches")
 }
 

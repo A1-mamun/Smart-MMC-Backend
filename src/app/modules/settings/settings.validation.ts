@@ -1,13 +1,18 @@
 import { z } from 'zod';
 
 /**
- * Single config row that drives the absent-warning feature. Persisted in
- * the generic `Setting` table keyed by `absent_warning_sms`. The radio
- * semantics on `mode`:
- *   - OFF    → the entire feature is disabled; the scheduler is silent
- *              and the "Absent on date" picker shows no rows.
- *   - MANUAL → admins send warnings from the SMS panel ad-hoc; no cron.
- *   - AUTO   → the scheduler fires on (dayOfWeek, hour, minute) every week.
+ * The absent-warning feature no longer has user-tunable knobs. The
+ * scheduler is always on (daily tick), the target date is always
+ * "today", the SMS goes to the father's mobile only, and the message
+ * body is hardcoded in `absentWarning.service.ts`. We keep the
+ * `absent_warning_sms` Setting row around for backward compatibility
+ * with already-deployed dashboards, but its shape is empty.
+ *
+ * Historical field reference (removed by this PR):
+ *   - mode ('OFF' | 'MANUAL' | 'AUTO')
+ *   - dayOfWeek + hour + minute (cron schedule)
+ *   - lookbackDays (1..3)
+ *   - message template
  */
 const weekdayEnum = [
   'Sunday',
@@ -48,47 +53,29 @@ export const examAbsenceConfigSchema = z.object({
   message: z.string().min(1).max(1600),
 });
 
-export const absentWarningConfigSchema = z.object({
-  mode: z.enum(ABSENT_WARNING_MODES),
-  dayOfWeek: z.enum(weekdayEnum),
-  hour: z.coerce.number().int().min(0).max(23),
-  minute: z.coerce.number().int().min(0).max(59),
-  // 1600-char cap matches the existing sendSmsSchema message cap.
-  message: z.string().min(1).max(1600),
-  // 1..3 — how many past calendar days to consider per tick. The default
-  // of 1 matches the user's example ("Sunday class → warn on Tuesday at
-  // 10:00 → look back 1 day which is Monday, hmm").
-  // In practice the scheduler skips non-class days naturally because
-  // getAllStudentsFromDB({ classDate }) returns 0 rows for them.
-  lookbackDays: z.coerce.number().int().min(1).max(3),
-});
+/**
+ * Absent-warning is now a constant-time, father-only, today-only job.
+ * The Settings row is kept (shape: empty object) for backwards compat
+ * with already-deployed clients that still issue a GET against this
+ * key. We accept ANY value here and the service code never reads it.
+ */
+export const absentWarningConfigSchema = z
+  .object({})
+  .passthrough();
 
 /**
  * PATCH-shaped upsert: every field optional, server merges with the
  * stored config + re-validates the merged result. Lets the UI split a
  * "Save" into partial edits without resubmitting the whole form.
  *
- * One endpoint serves BOTH features. The body is flat — `mode` etc. for
- * the absent-warning and `examAbsence*` for the exam-absence — and the
- * server projects them onto the right underlying Setting row before
- * persisting. The `message` field is mapped to absent-warning; the new
- * `examAbsenceMessage` is mapped to the exam template.
+ * The absent-warning PATCH fields (mode/dayOfWeek/hour/minute/lookbackDays/
+ * message/absentMessage) have been removed — the feature is no longer
+ * user-configurable. Only the exam-absence fields remain.
  */
 export const upsertConfigSchema = z.object({
   body: z
     .object({
-      // absent-warning (existing)
-      mode: z.enum(ABSENT_WARNING_MODES).optional(),
-      dayOfWeek: z.enum(weekdayEnum).optional(),
-      hour: z.coerce.number().int().min(0).max(23).optional(),
-      minute: z.coerce.number().int().min(0).max(59).optional(),
-      // Both `message` and `absentMessage` resolve to the absent-warning
-      // template; `absentMessage` exists for backward compat with any
-      // saved dashboards.
-      message: z.string().min(1).max(1600).optional(),
-      absentMessage: z.string().min(1).max(1600).optional(),
-      lookbackDays: z.coerce.number().int().min(1).max(3).optional(),
-      // exam-absence (new)
+      // exam-absence (the only remaining user-tunable feature)
       examAbsenceEnabled: z.boolean().optional(),
       examAbsenceDelayDays: z.coerce.number().int().min(1).max(7).optional(),
       examAbsenceHour: z.coerce.number().int().min(0).max(23).optional(),
@@ -106,15 +93,12 @@ export type TExamAbsenceConfig = z.infer<typeof examAbsenceConfigSchema>;
 // fans them out to the right sub-config.
 export type TConfigPatch = z.infer<typeof upsertConfigSchema>['body'];
 
-export const DEFAULT_ABSENT_WARNING_CONFIG: TAbsentWarningConfig = {
-  mode: 'MANUAL',
-  dayOfWeek: 'Tuesday',
-  hour: 10,
-  minute: 0,
-  message:
-    'Dear parent, your ward {studentName} was absent from class on {classDate}. Please ensure regular attendance.',
-  lookbackDays: 1,
-};
+/**
+ * Absent-warning default is an empty object — the service never reads
+ * it. Kept so the GET path can still return a valid (empty) shape when
+ * the row is missing.
+ */
+export const DEFAULT_ABSENT_WARNING_CONFIG: TAbsentWarningConfig = {};
 
 export const DEFAULT_EXAM_ABSENCE_CONFIG: TExamAbsenceConfig = {
   enabled: false,

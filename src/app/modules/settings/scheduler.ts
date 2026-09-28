@@ -15,18 +15,15 @@ let absentLastFiredKey = '';
 let examLastFiredKey = '';
 
 /**
- * Start BOTH cron-backed schedulers. Each ticks every minute; the per-task
- * guard clauses bail early if the configuration says so.
+ * Start BOTH cron-backed schedulers.
  *
- *   1. **absent-warning** — fires on the configured (dayOfWeek, hour, minute)
- *      and walks the look-back window. Late or early ticks are no-ops.
+ *   1. **absent-warning** — fires every minute, but the per-day latch
+ *      collapses the tick to one run per calendar day. Targets students
+ *      who had class TODAY but have no Attendance row for today. SMS
+ *      goes to the father's mobile only. Always on (no Settings gate).
  *   2. **exam-absence** — fires once per day at the configured
- *      (hour, minute) and processes every absent examinee whose exam was
- *      `delayDays` ago.
- *
- * The look-back window is `cfg.lookbackDays` calendar days ending today
- * — for each, the absent-warning inner job filters down to students
- * whose BatchDay hits that weekday (so non-class days naturally no-op).
+ *      (hour, minute) and processes every absent examinee whose exam
+ *      was `delayDays` ago.
  *
  * Skipped when `config.node_env === 'test'` so `pnpm build` and CI runs
  * don't drag in cron state.
@@ -35,35 +32,23 @@ export const startAllSchedulers = () => {
   if (absentTask || examTask) return;
   if (config.node_env === 'test') return;
 
-  // ----- absent-warning tick (unchanged behaviour) -----
+  // ----- absent-warning tick (always-on, today only) -----
   absentTask = cron.schedule(
     '* * * * *',
     async () => {
       try {
-        const cfg = (await SettingsService.getConfigFromDB()).absentWarning;
-        if (cfg.mode !== 'AUTO') return;
-
         const now = dayjs();
-        const dow = now.format('dddd');
-        if (cfg.dayOfWeek !== dow) return;
-        if (now.hour() !== cfg.hour) return;
-        if (now.minute() !== cfg.minute) return;
-
-        const fireKey = `${now.format('YYYY-MM-DD-HH-mm')}`;
+        // Daily latch: fire once per YYYY-MM-DD. The minute-precision
+        // latch is unnecessary because the service itself is idempotent
+        // (per-ISO-week dedupe in WeeklyAbsentWarning), but capping at
+        // once/day is cheaper than re-running the full cohort query on
+        // every minute tick.
+        const fireKey = `absent:${now.format('YYYY-MM-DD')}`;
         if (absentLastFiredKey === fireKey) return;
         absentLastFiredKey = fireKey;
 
-        // Walk back `lookbackDays` calendar days. The inner service
-        // applies the BatchDay weekday filter so non-class days are a
-        // near-zero-cost no-op.
-        const targetDates = Array.from(
-          { length: cfg.lookbackDays },
-          (_, i) => now.subtract(i, 'day').format('YYYY-MM-DD'),
-        );
-
         const result = await AbsentWarningService.runForTargets(
-          cfg,
-          targetDates,
+          [now.format('YYYY-MM-DD')],
           'SYSTEM',
           'SYSTEM',
         );
@@ -78,7 +63,7 @@ export const startAllSchedulers = () => {
     },
   );
 
-  // ----- exam-absence tick (new) -----
+  // ----- exam-absence tick (unchanged) -----
   examTask = cron.schedule(
     '* * * * *',
     async () => {

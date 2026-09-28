@@ -80,7 +80,20 @@ const studentInclude = {
   },
   studentCourses: {
     where: { isDeleted: false },
-    include: {
+    // Explicit scalar select so `studentCourseId` (per-enrollment ID
+    // like "271200") is guaranteed on the wire — needed by the
+    // students list table to render one row per active enrollment.
+    // Without an explicit select, Prisma already returns it, but
+    // spelling it out here keeps the contract obvious for future
+    // maintainers and pairs naturally with the type-side field.
+    select: {
+      id: true,
+      studentCourseId: true,
+      courseId: true,
+      enrolledAt: true,
+      isCompleted: true,
+      completedAt: true,
+      status: true,
       course: true,
       payments: { where: { isDeleted: false }, select: { amount: true } },
     },
@@ -103,13 +116,58 @@ const studentInclude = {
 } satisfies Prisma.StudentInclude;
 
 /**
+ * Count active (non-deleted) enrollments for a single (batchDay, batchTime)
+ * slot. Used by the seat-cap gate inside `resolveBatchDayForCourse`.
+ *
+ * Each student admitted to a slot creates exactly one `StudentBatch`
+ * row linking them to `(batchDayId, batchTime)`. Counting those rows
+ * scoped to the slot gives the live enrollment count for that slot —
+ * which is the unit the user clarified the cap applies to
+ * (Course.totalSeats means "seats per slot", not "seats per course").
+ *
+ * Mirrors the soft-delete filter used elsewhere in this module
+ * (`studentInclude` below) so deleted enrollments don't lock seats
+ * indefinitely.
+ */
+const countEnrolledForSlot = async (
+  tx: Prisma.TransactionClient,
+  batchDayId: string,
+  batchTime: string,
+): Promise<number> => {
+  return tx.studentBatch.count({
+    where: {
+      batchDayId,
+      batchTime,
+      isDeleted: false,
+      student: { isDeleted: false },
+    },
+  });
+};
+
+/**
  * Validate that the selected batch day + time belong to the chosen course.
  * Returns the matched BatchDay row so the caller can reuse it for the
  * `StudentBatch` write without re-querying. Shared by the admit path and
  * the existing-student enrollment path so both enforce the same invariant.
+ *
+ * Also enforces the per-course seat cap (Course.totalSeats): a SELECT …
+ * FOR UPDATE on the Course row serializes concurrent admits so the
+ * cap cannot be exceeded by a race.
  */
-const resolveBatchDayForCourse = async (courseId: string, batchDayId: string, batchTime: string) => {
-  const course = await prisma.course.findUnique({
+const resolveBatchDayForCourse = async (
+  tx: Prisma.TransactionClient,
+  courseId: string,
+  batchDayId: string,
+  batchTime: string,
+) => {
+  // Pessimistic lock on the Course row. The lock is held until the
+  // outer transaction commits, so a concurrent admit that started one
+  // millisecond later will block here until our count + insert finish.
+  // This is the strongest defence against two admins admitting the
+  // (cap+1)th student simultaneously.
+  await tx.$queryRaw`SELECT id FROM courses WHERE id = ${courseId} FOR UPDATE`;
+
+  const course = await tx.course.findUnique({
     where: { id: courseId },
     include: { batchDays: { orderBy: { position: 'asc' } } },
   });
@@ -137,6 +195,27 @@ const resolveBatchDayForCourse = async (courseId: string, batchDayId: string, ba
   if (!matchingBatchDay.times.includes(batchTime)) {
     throw new AppError(httpStatus.BAD_REQUEST, `Selected time is not offered for this batch day`);
   }
+
+  // Seat-cap gate. NULL totalSeats = uncapped; otherwise refuse when
+  // the live enrollment count for THIS SLOT (batchDay + batchTime)
+  // has hit the cap. Slots are independent: a course with two batch
+  // days × two times = four slots, each with its own quota. The cap
+  // (`Course.totalSeats`) is set on the Courses page; the per-slot
+  // count is derived from `StudentBatch` rows.
+  if (course.totalSeats != null) {
+    const enrolled = await countEnrolledForSlot(
+      tx,
+      matchingBatchDay.id,
+      batchTime,
+    );
+    if (enrolled >= course.totalSeats) {
+      throw new AppError(
+        httpStatus.CONFLICT,
+        `Slot "${matchingBatchDay.name}" at ${batchTime} is full (${enrolled}/${course.totalSeats} seats taken). Pick another slot or increase the cap on the Courses page.`,
+      );
+    }
+  }
+
   return { course, matchingBatchDay };
 };
 
@@ -158,72 +237,77 @@ const enrollExistingStudentToDB = async (
   payload: TEnrollExistingStudent,
   user: JwtPayload,
 ) => {
-  const { course, matchingBatchDay } = await resolveBatchDayForCourse(
-    payload.courseId,
-    payload.batchDayId,
-    payload.batchTime,
-  );
-
-  const existingStudent = await prisma.student.findFirst({
-    where: { mobile: payload.mobile, isDeleted: false },
-    include: { user: true },
-  });
-  if (!existingStudent) {
-    throw new AppError(
-      httpStatus.NOT_FOUND,
-      'No active student profile found for this mobile number',
+  // Wrap the entire body in a single transaction so the seat-cap gate's
+  // SELECT … FOR UPDATE lock is held until the StudentCourse +
+  // StudentBatch writes commit. resolveBatchDayForCourse requires `tx`
+  // so the lock and the count participate in the same connection.
+  return prisma.$transaction(async (tx) => {
+    const { course, matchingBatchDay } = await resolveBatchDayForCourse(
+      tx,
+      payload.courseId,
+      payload.batchDayId,
+      payload.batchTime,
     );
-  }
 
-  // Guard against double-enrolment in the SAME course. The unique
-  // index on (studentId, courseId) would catch this anyway, but
-  // surfacing a friendly error makes the admin's intent clearer.
-  const alreadyEnrolled = await prisma.studentCourse.findFirst({
-    where: {
-      studentId: existingStudent.id,
-      courseId: course.id,
-      isDeleted: false,
-    },
-  });
-  if (alreadyEnrolled) {
-    throw new AppError(
-      httpStatus.CONFLICT,
-      'This student is already enrolled in this course',
-    );
-  }
+    const existingStudent = await tx.student.findFirst({
+      where: { mobile: payload.mobile, isDeleted: false },
+      include: { user: true },
+    });
+    if (!existingStudent) {
+      throw new AppError(
+        httpStatus.NOT_FOUND,
+        'No active student profile found for this mobile number',
+      );
+    }
 
-  // Gate: a student may not enroll in another course while they have
-  // an active enrollment in a course whose batch is not yet marked
-  // complete. Without this, a student could be in HSC_1ST_YEAR and
-  // HSC_2ND_YEAR simultaneously, which is what the user explicitly
-  // wants to forbid ("can enroll another course after finished the
-  // current course"). We surface the blocking course name(s) in the
-  // error so the admin knows exactly which one to mark complete.
-  const blockingEnrollments = await prisma.studentCourse.findMany({
-    where: {
-      studentId: existingStudent.id,
-      isDeleted: false,
-      courseId: { not: course.id },
-      course: { isCompleted: false },
-    },
-    select: { course: { select: { name: true } } },
-  });
-  if (blockingEnrollments.length > 0) {
-    const names = blockingEnrollments
-      .map((e) => e.course.name)
-      .filter((n, i, arr) => arr.indexOf(n) === i) // unique
-      .join(', ');
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      `Cannot enroll: this student still has an active enrollment in ${names}, which has not been marked as completed yet. Mark the course(s) as complete first, then retry.`,
-    );
-  }
+    // Guard against double-enrolment in the SAME course. The unique
+    // index on (studentId, courseId) would catch this anyway, but
+    // surfacing a friendly error makes the admin's intent clearer.
+    const alreadyEnrolled = await tx.studentCourse.findFirst({
+      where: {
+        studentId: existingStudent.id,
+        courseId: course.id,
+        isDeleted: false,
+      },
+    });
+    if (alreadyEnrolled) {
+      throw new AppError(
+        httpStatus.CONFLICT,
+        'This student is already enrolled in this course',
+      );
+    }
 
-  // Generate the per-enrollment ID using the new course's
-  // hscBatch+name (roll is global per prefix, not per student).
-  const newStudentCourseId = await generateStudentId(course.hscBatch, course.name);
+    // Gate: a student may not enroll in another course while they have
+    // an active enrollment in a course whose batch is not yet marked
+    // complete. Without this, a student could be in HSC_1ST_YEAR and
+    // HSC_2ND_YEAR simultaneously, which is what the user explicitly
+    // wants to forbid ("can enroll another course after finished the
+    // current course"). We surface the blocking course name(s) in the
+    // error so the admin knows exactly which one to mark complete.
+    const blockingEnrollments = await tx.studentCourse.findMany({
+      where: {
+        studentId: existingStudent.id,
+        isDeleted: false,
+        courseId: { not: course.id },
+        course: { isCompleted: false },
+      },
+      select: { course: { select: { name: true } } },
+    });
+    if (blockingEnrollments.length > 0) {
+      const names = blockingEnrollments
+        .map((e) => e.course.name)
+        .filter((n, i, arr) => arr.indexOf(n) === i) // unique
+        .join(', ');
+      throw new AppError(
+        httpStatus.BAD_REQUEST,
+        `Cannot enroll: this student still has an active enrollment in ${names}, which has not been marked as completed yet. Mark the course(s) as complete first, then retry.`,
+      );
+    }
 
-  const result = await prisma.$transaction(async (tx) => {
+    // Generate the per-enrollment ID using the new course's
+    // hscBatch+name (roll is global per prefix, not per student).
+    const newStudentCourseId = await generateStudentId(course.hscBatch, course.name);
+
     const enrollment = await tx.studentCourse.create({
       data: {
         studentId: existingStudent.id,
@@ -271,36 +355,47 @@ const enrollExistingStudentToDB = async (
       },
     });
 
-    return tx.student.findUnique({
+    const result = await tx.student.findUnique({
       where: { id: existingStudent.id },
       include: studentInclude,
     });
+
+    await clearStudentCache();
+
+    return {
+      student: result,
+      // Reuse-case: no new credentials are generated. The student's
+      // existing login (mobile) keeps working unchanged.
+      initialPassword: null as string | null,
+      studentId: existingStudent.user.studentId,
+      studentCourseId: newStudentCourseId,
+      alreadyEnrolled: true as const,
+    };
   });
-
-  await clearStudentCache();
-
-  return {
-    student: result,
-    // Reuse-case: no new credentials are generated. The student's
-    // existing login (mobile) keeps working unchanged.
-    initialPassword: null as string | null,
-    studentId: existingStudent.user.studentId,
-    studentCourseId: newStudentCourseId,
-    alreadyEnrolled: true as const,
-  };
 };
 
 const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
-  const { course, matchingBatchDay } = await resolveBatchDayForCourse(
-    payload.courseId,
-    payload.batchDayId,
-    payload.batchTime,
-  );
+  // Cheap pre-fetch of just the scalars needed for the per-enrollment
+  // ID generation that happens BEFORE we open the transaction. We do
+  // NOT take the seat-cap lock here — the authoritative gate runs
+  // inside the transaction below, with the same `course.id`.
+  const courseMeta = await prisma.course.findUnique({
+    where: { id: payload.courseId },
+    select: { hscBatch: true, name: true },
+  });
+  if (!courseMeta || courseMeta.name === null) {
+    // Should never happen — `resolveBatchDayForCourse` re-checks inside
+    // the tx — but a quick guard avoids a confusing null reference.
+    throw new AppError(httpStatus.BAD_REQUEST, 'Selected course not found');
+  }
 
   // Detect an existing ACTIVE student profile by phone. If found, we
   // delegate to `enrollExistingStudentToDB` so the reuse logic lives in
   // exactly one place — both the admit endpoint and the dedicated
   // `/student/enroll-existing` endpoint share it.
+  // The reuse branch opens its own transaction and runs the seat-cap
+  // gate inside it; we don't pre-lock here so the unused lock isn't
+  // held across the network round-trip to detect the existing student.
   const existingStudent = await prisma.student.findFirst({
     where: { mobile: payload.mobile, isDeleted: false },
     select: { id: true },
@@ -320,7 +415,7 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
   // ── Fresh admit path ──────────────────────────────────────────────
   // First time this phone number is on file — create User, Student,
   // and the first StudentCourse + StudentBatch atomically.
-  const studentId = await generateStudentId(course.hscBatch, course.name);
+  const studentId = await generateStudentId(courseMeta.hscBatch, courseMeta.name);
   // The initial password is the freshly-generated studentId (e.g. "271206"
   // for HSC batch 27, year 1, roll 206). On first sign-in the student is
   // forced through the change-password flow (`User.mustChangePassword`
@@ -334,6 +429,16 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
   const hashedPassword = await bcrypt.hash(initialPassword, Number(config.bcryptSaltRounds) || 12);
 
   const student = await prisma.$transaction(async (tx) => {
+    // Run the seat-cap gate (with its FOR UPDATE lock) INSIDE this
+    // transaction so the lock is held until the StudentCourse write
+    // commits. Without this, a concurrent admit could squeeze through
+    // between the gate and the insert and over-fill the course.
+    const { course, matchingBatchDay } = await resolveBatchDayForCourse(
+      tx,
+      payload.courseId,
+      payload.batchDayId,
+      payload.batchTime,
+    );
     const newUser = await tx.user.create({
       data: {
         studentId,
@@ -516,7 +621,15 @@ const getAllStudentsFromDB = async (
   }
 
   if (batchDay || batchTime) {
-    const batchWhere: Prisma.StudentBatchWhereInput = { isDeleted: false };
+    // When `courseId` is also set, scope the batch to this course via
+    // the FK relation — a student enrolled in multiple courses must
+    // satisfy the time/day filter on a batch in the chosen course.
+    // Otherwise, the legacy single-course students page filter keeps
+    // its looser behaviour (any batch matches).
+    const batchWhere: Prisma.StudentBatchWhereInput = {
+      isDeleted: false,
+      ...(courseId ? { batchDayRel: { courseId } } : {}),
+    };
     if (batchDay) batchWhere.batchDay = batchDay;
     if (batchTime) batchWhere.batchTime = batchTime;
     andConditions.push({ batches: { some: batchWhere } });
@@ -529,41 +642,75 @@ const getAllStudentsFromDB = async (
   // HSC 1st Year".
   // ---------------------------------------------------------------------
 
-  // (a) Class-date + optional class-time → resolve to a list of BatchDay
-  //     rows whose `days[]` contains the chosen weekday (case-insensitive).
-  //     When `classTime` is supplied we further intersect with rows whose
-  //     `times[]` contains that slot. We fetch matching BatchDay ids first
-  //     then filter students by `StudentBatch.batchDayId IN (...)`. Empty
-  //     match is short-circuited via `id: { in: [] }`.
-  if (classDate) {
+  // (a) Class-date + optional class-time, AND class-time-only.
+  //
+  //     Class-date resolves to a weekday, then we look up BatchDay rows
+  //     whose `days[]` contains that weekday (case-insensitive — Prisma's
+  //     `has` is exact-match on Postgres text-array elements).
+  //     Class-time is matched against the student's actual enrollment
+  //     time (`StudentBatch.batchTime`), NOT the parent `BatchDay.times[]`
+  //     catalog — otherwise a BatchDay with times=["4:00 PM","10:00 AM"]
+  //     would falsely return a student enrolled at 4:00 PM when the user
+  //     filters for 10:00 AM.
+  //
+  //     The two filters are independent: classTime alone works (just
+  //     narrows by enrollment time across all batches), classDate alone
+  //     works (just narrows by weekday), and combining them intersects
+  //     both. Empty classDate-match is short-circuited via
+  //     `id: { in: [] }`.
+  if (classDate || classTime) {
     // `classDate` reaches us as the raw string from req.query because the
     // validateRequest middleware only validates and discards the parsed
     // result. Coerce here so weekdayNameFor (which calls .getDay()) doesn't
     // crash with "d.getDay is not a function" when the frontend passes an
     // ISO yyyy-mm-dd string.
-    const classDateObj =
-      classDate instanceof Date ? classDate : new Date(classDate);
-    const weekday = weekdayNameFor(classDateObj);
-    const matchingBatchDays = await prisma.batchDay.findMany({
-      where: {
-        days: { has: weekday },
-        ...(classTime ? { times: { has: classTime } } : {}),
-        course: { isDeleted: false },
-      },
-      select: { id: true, days: true },
-    });
-    // Re-filter manually for case-insensitive match (Prisma's `has` is
-    // exact equality on Postgres text-array elements).
-    const lowerWeekday = weekday.toLowerCase();
-    const ids = matchingBatchDays
-      .filter((b) => b.days.some((d) => d.toLowerCase() === lowerWeekday))
-      .map((b) => b.id);
-    if (ids.length === 0) {
+    const classDateObj = classDate
+      ? classDate instanceof Date
+        ? classDate
+        : new Date(classDate)
+      : null;
+
+    let matchingBatchDayIds: string[] | null = null;
+    if (classDateObj) {
+      const weekday = weekdayNameFor(classDateObj);
+      const matchingBatchDays = await prisma.batchDay.findMany({
+        // When `courseId` is also set, restrict the lookup to that
+        // course's BatchDay rows. Otherwise look up across all courses.
+        where: {
+          course: { isDeleted: false, ...(courseId ? { id: courseId } : {}) },
+        },
+        select: { id: true, days: true },
+      });
+      const lowerWeekday = weekday.toLowerCase();
+      matchingBatchDayIds = matchingBatchDays
+        .filter((b) =>
+          b.days.some((d) => d.toLowerCase() === lowerWeekday),
+        )
+        .map((b) => b.id);
+    }
+
+    // Build a single StudentBatch constraint that AND-combines all of:
+    //   - the matched BatchDay ids (from classDate), if any
+    //   - the chosen classTime, if any
+    //   - isDeleted: false
+    //   - when `courseId` is also set, scope the batch to that course
+    //     so a student enrolled in multiple courses only matches if
+    //     one of those batches is in the chosen course.
+    // When classDate yields zero matches we short-circuit the whole
+    // query by adding `id: { in: [] }` — there's no student whose
+    // batches include a non-existent BatchDay.
+    if (matchingBatchDayIds !== null && matchingBatchDayIds.length === 0) {
       andConditions.push({ id: { in: [] } });
     } else {
-      andConditions.push({
-        batches: { some: { batchDayId: { in: ids }, isDeleted: false } },
-      });
+      const batchWhere: Prisma.StudentBatchWhereInput = {
+        isDeleted: false,
+        ...(courseId ? { batchDayRel: { courseId } } : {}),
+        ...(matchingBatchDayIds !== null
+          ? { batchDayId: { in: matchingBatchDayIds } }
+          : {}),
+        ...(classTime ? { batchTime: classTime } : {}),
+      };
+      andConditions.push({ batches: { some: batchWhere } });
     }
   }
 

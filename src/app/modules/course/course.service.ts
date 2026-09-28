@@ -18,6 +18,14 @@ const courseInclude = {
   batchDays: {
     orderBy: { position: 'asc' as const },
   },
+  // Aggregate enrolled-student counts so the frontend can render a
+  // live "X / Y seats taken" badge without a second round-trip. Counts
+  // include soft-deleted StudentCourse rows; the backend's transaction-
+  // locked count inside `resolveBatchDayForCourse` is the source of
+  // truth for actual admission.
+  _count: {
+    select: { studentCourses: true },
+  },
 };
 
 const createCourseToDB = async (payload: TCreateCourse) => {
@@ -37,6 +45,11 @@ const createCourseToDB = async (payload: TCreateCourse) => {
         description: payload.description,
         fee: new Prisma.Decimal(payload.fee),
         hscBatch: payload.hscBatch,
+        // Persist the cap verbatim when supplied; let the Prisma
+        // `@default(120)` take over when the field is missing. The
+        // "explicit null = uncapped" path means we only persist
+        // `null` when the client intentionally sent null.
+        totalSeats: payload.totalSeats === undefined ? undefined : payload.totalSeats,
       },
     });
     for (const [position, day] of payload.batchDays.entries()) {
@@ -99,6 +112,63 @@ const getCourseByIdFromDB = async (id: string) => {
   return course;
 };
 
+/**
+ * Per-slot seat-cap read-out for a course.
+ *
+ * `Course.totalSeats` is interpreted as "seats per (batchDay, batchTime)
+ * slot" — see resolveBatchDayForCourse for the authoritative gate. This
+ * endpoint returns the live `studentBatch` count per slot so the
+ * frontend picker can disable full slots without a second transaction.
+ *
+ * `groupBy` runs against the new `(batchDayId, batchTime)` compound
+ * index, scoped by `batchDayRel.courseId` so foreign / deleted
+ * BatchDay rows never contaminate the count. Slots that have never
+ * been used simply don't appear in the response — the frontend
+ * renders them with `enrolled = 0` via the Map.get fallback.
+ */
+const getCourseSeatsFromDB = async (courseId: string) => {
+  const course = await prisma.course.findUnique({
+    where: { id: courseId, isDeleted: false },
+    select: { id: true, totalSeats: true },
+  });
+  if (!course) {
+    throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
+  }
+
+  const rows = await prisma.studentBatch.groupBy({
+    by: ['batchDayId', 'batchTime'],
+    where: {
+      isDeleted: false,
+      student: { isDeleted: false },
+      // BatchDay itself doesn't carry `isDeleted` — soft-delete lives
+      // only on the relations to it. We filter by `courseId` instead,
+      // which scopes the join to the right course. (Foreign / hard-
+      // deleted BatchDay rows with mismatched courseId never make it
+      // into the join.)
+      batchDayRel: { courseId },
+    },
+    _count: { _all: true },
+  });
+
+  return {
+    totalSeats: course.totalSeats,
+    slots: rows
+      .map((r) => ({
+        // batchDayId can technically be null on StudentBatch (legacy
+        // rows whose BatchDay was hard-deleted, leaving the FK as
+        // NULL). We filter those out by skipping rows whose
+        // batchDayId is null — they can't be matched to a slot in the
+        // picker anyway.
+        batchDayId: r.batchDayId as string | null,
+        batchTime: r.batchTime,
+        enrolled: r._count._all ?? 0,
+      }))
+      .filter((s): s is { batchDayId: string; batchTime: string; enrolled: number } =>
+        s.batchDayId != null,
+      ),
+  };
+};
+
 // const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
 //   const data: Prisma.CourseUpdateInput = {};
 //   if (payload.name) data.name = payload.name;
@@ -150,6 +220,12 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
 
   if (payload.hscBatch !== undefined) {
     data.hscBatch = payload.hscBatch;
+  }
+
+  if (payload.totalSeats !== undefined) {
+    // `null` is meaningful here — "uncapped". The Prisma update accepts
+    // null to clear the field; `undefined` (key absent) means don't touch.
+    data.totalSeats = payload.totalSeats;
   }
 
   if (payload.isActive !== undefined) {
@@ -355,6 +431,7 @@ export const CourseService = {
   createCourseToDB,
   getAllCoursesFromDB,
   getCourseByIdFromDB,
+  getCourseSeatsFromDB,
   updateCourseInDB,
   toggleCourseActiveToDB,
   markCourseCompletedToDB,

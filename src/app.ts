@@ -13,7 +13,10 @@ import config from './app/config';
 
 const app = express();
 
-const origins = (config.frontendUrls || 'http://localhost:3000').split(',').map((o) => o.trim());
+const origins = config
+  .frontendUrls!.split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
 
 app.use(
   cors({

@@ -46,6 +46,16 @@ const getCourseById = catchAsync(async (req, res) => {
   });
 });
 
+const getCourseSeats = catchAsync(async (req, res) => {
+  const result = await CourseService.getCourseSeatsFromDB(req.params.id as string);
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Course seat counts retrieved successfully',
+    data: result,
+  });
+});
+
 const updateCourse = catchAsync(async (req, res) => {
   const result = await CourseService.updateCourseInDB(req.params.id as string, req.body);
   sendResponse(res, {
@@ -100,6 +110,7 @@ export const CourseController = {
   createCourse,
   getAllCourses,
   getCourseById,
+  getCourseSeats,
   updateCourse,
   deleteCourse,
   toggleActive,

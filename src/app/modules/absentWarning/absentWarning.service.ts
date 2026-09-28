@@ -7,8 +7,6 @@ import httpStatus from 'http-status';
 import { StudentService } from '../student/student.service';
 import { SmsService } from '../sms/sms.service';
 import { toIntl } from '../../utils/phone';
-import { SettingsService } from '../settings/settings.service';
-import { TAbsentWarningConfig } from '../settings/settings.validation';
 
 // dayjs iso-week plugins for the per-week dedupe key.
 dayjs.extend(isoWeek);
@@ -25,14 +23,23 @@ type TJobResult = {
 };
 
 /**
+ * Hardcoded SMS body. The user explicitly removed the Settings UI for
+ * absent-warning (mode/schedule/template) — the job is now always-on,
+ * always "today only", always father-only. The message is fixed so
+ * there is nothing for the UI to misconfigure.
+ */
+const ABSENT_WARNING_MESSAGE =
+  'Dear parent, your ward {studentName} was absent from class today ({classDate}). Please ensure regular attendance.';
+
+/**
  * Build the recipient list for a single target date WITHOUT sending.
  * Used by the SMS panel's "Absent on date" filter (the admin reviews
  * the list, types a message, then clicks Send through the regular
  * /api/v1/sms endpoint — so the picker doesn't need to do the send).
  *
- * Returns both the recipient-shaped array (with father-mobile fallback
- * already applied and `toIntl()` normalised) AND a `skipped` array
- * for students with no valid mobile on any channel.
+ * Per spec: father's mobile ONLY. No mother / self fallback. Students
+ * without a usable father-mobile are reported in `skipped` so the
+ * admin can see why a row didn't make the cut.
  */
 const getAbsentPickerFromDB = async (params: { date: string }) => {
   const targetDate = dayjs(params.date).startOf('day').toDate();
@@ -44,7 +51,7 @@ const getAbsentPickerFromDB = async (params: { date: string }) => {
     );
   }
 
-  // Reuse the existing cohort resolver — `absentOnDate` is now part of
+  // Reuse the existing cohort resolver — `absentOnDate` is part of
   // the getAllStudentsFromDB filter chain (subtracts Attendance rows
   // for the date automatically).
   const cohort = await StudentService.getAllStudentsFromDB(
@@ -56,40 +63,22 @@ const getAbsentPickerFromDB = async (params: { date: string }) => {
     studentId: string;
     name: string;
     mobile: string;
-    channel: 'father' | 'mother' | 'self';
   }[] = [];
   const skipped: { studentId: string; name: string; reason: string }[] = [];
 
   for (const s of cohort.data) {
     const fatherIntl = s.fatherMobile ? toIntl(s.fatherMobile) : null;
-    const motherIntl = s.motherMobile ? toIntl(s.motherMobile) : null;
-    const selfIntl = toIntl(s.mobile);
     if (fatherIntl) {
       recipients.push({
         studentId: s.id,
         name: s.user.name,
         mobile: fatherIntl,
-        channel: 'father',
-      });
-    } else if (motherIntl) {
-      recipients.push({
-        studentId: s.id,
-        name: s.user.name,
-        mobile: motherIntl,
-        channel: 'mother',
-      });
-    } else if (selfIntl) {
-      recipients.push({
-        studentId: s.id,
-        name: s.user.name,
-        mobile: selfIntl,
-        channel: 'self',
       });
     } else {
       skipped.push({
         studentId: s.id,
         name: s.user.name,
-        reason: 'No valid mobile (father / mother / self)',
+        reason: 'No valid father mobile',
       });
     }
   }
@@ -108,52 +97,49 @@ const getAbsentPickerFromDB = async (params: { date: string }) => {
 
 /**
  * Run the absent-warning job end-to-end. Called by:
- *   1. The cron scheduler (once per matching dayOfWeek/hour/minute),
- *      with `actorId='SYSTEM'` and `actorRole='SYSTEM'`.
+ *   1. The cron scheduler (daily tick), with `actorId='SYSTEM'`
+ *      and `actorRole='SYSTEM'`.
  *   2. The settings page "Run now" button — same call but with the
- *      signed-in admin as actor.
+ *      signed-in admin as actor. (Note: the Settings page no longer
+ *      exposes this button by default; the route still exists as an
+ *      admin escape hatch for manual back-fills.)
  *
- * The job's idempotency is enforced by `WeeklyAbsentWarning`: a row
- * per (studentId, isoYear, isoWeek) blocks re-warns for the rest of
- * the week, matching the user's "max one time in a week" rule.
+ * The job targets students who had a class TODAY but have no
+ * Attendance row for today — i.e. real-time same-day absence. The
+ * idempotency is enforced by `WeeklyAbsentWarning`: a row per
+ * (studentId, isoYear, isoWeek) blocks re-warns for the rest of the
+ * week, matching the user's "max one time in a week" rule.
+ *
+ * SMS is sent to the father's mobile only. There is no mother / self
+ * fallback. Students with no usable father-mobile are tracked as
+ * `skipped` so the operator can see WHY a row didn't deliver.
  */
 const runAbsentWarningJobFromDB = async (
   actorId: string,
   actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
 ): Promise<TJobResult> => {
-  const config = (await SettingsService.getConfigFromDB()).absentWarning;
-  if (config.mode === 'OFF') {
-    return { sent: 0, skipped: 0, total: 0, datesProcessed: [] };
-  }
-
-  // Compute the look-back window: the last `lookbackDays` calendar
-  // days ending today. Non-class days naturally return zero cohort.
-  const today = dayjs();
-  const targetDates = Array.from(
-    { length: config.lookbackDays },
-    (_, i) => today.subtract(i, 'day').format('YYYY-MM-DD'),
-  );
-
-  return runForTargets(config, targetDates, actorId, actorRole);
+  // Today only — the spec is "students who had class today but did
+  // not attend". We still pass through `runForTargets` so the dedupe
+  // + chunked-send code path is reused.
+  const today = dayjs().format('YYYY-MM-DD');
+  return runForTargets([today], actorId, actorRole);
 };
 
 /**
- * The lower-level entry point the cron scheduler uses to inject its
- * pre-computed target dates (so the "Run now" admin button can't be
- * used to backfill arbitrary past weeks without re-implementing the
- * look-back logic). Exported because the absent-warning route can
- * call it directly with a user-supplied date for one-off backfills.
+ * Lower-level entry point the cron scheduler uses to inject its
+ * pre-computed target dates. Exported because the absent-warning
+ * route can call it directly with a user-supplied date for one-off
+ * back-fills.
+ *
+ * Per spec: father's mobile only, hardcoded message. The signature
+ * stays target-date-array based so a manual back-fill can pass a
+ * non-today date without re-implementing dedupe / chunking.
  */
 const runForTargets = async (
-  config: TAbsentWarningConfig,
   targetDates: string[],
   actorId: string,
   actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
 ): Promise<TJobResult> => {
-  if (config.mode === 'OFF') {
-    return { sent: 0, skipped: 0, total: 0, datesProcessed: targetDates };
-  }
-
   // Per-ISO-week dedupe set.
   const isoYearNow = dayjs().isoWeekYear();
   const isoWeekNow = dayjs().isoWeek();
@@ -165,13 +151,14 @@ const runForTargets = async (
 
   // For each target date, pull the cohort (expected minus present).
   // We dedupe by studentId across dates — if a student was absent on
-  // both Sunday and Monday in the look-back window, we only warn
+  // both Sunday and Monday in the back-fill window, we only warn
   // them once (matches "one warning per week"), using the most-recent
   // absent-date in the substituted message.
   const perStudentAbsents = new Map<
     string,
     { name: string; mobile: string; absentDate: Date }
   >();
+  const skippedNoFatherMobile: string[] = [];
 
   for (const isoDate of targetDates) {
     const d = dayjs(isoDate).startOf('day').toDate();
@@ -182,14 +169,15 @@ const runForTargets = async (
     for (const s of cohort.data) {
       if (alreadyWarned.has(s.id)) continue;
       if (perStudentAbsents.has(s.id)) continue; // earliest wins
+      // Father-only by spec — no mother / self fallback.
       const fatherIntl = s.fatherMobile ? toIntl(s.fatherMobile) : null;
-      const motherIntl = s.motherMobile ? toIntl(s.motherMobile) : null;
-      const selfIntl = toIntl(s.mobile);
-      const intlMobile = fatherIntl || motherIntl || selfIntl;
-      if (!intlMobile) continue;
+      if (!fatherIntl) {
+        skippedNoFatherMobile.push(s.id);
+        continue;
+      }
       perStudentAbsents.set(s.id, {
         name: s.user.name,
-        mobile: intlMobile,
+        mobile: fatherIntl,
         absentDate: d,
       });
     }
@@ -207,7 +195,7 @@ const runForTargets = async (
   if (recipients.length === 0) {
     return {
       sent: 0,
-      skipped: 0,
+      skipped: skippedNoFatherMobile.length,
       total: 0,
       datesProcessed: targetDates,
     };
@@ -226,15 +214,14 @@ const runForTargets = async (
     // The gateway log stores a SINGLE message body — pick the most
     // common absent-date in the chunk for the per-chunk log row.
     // Per-recipient substitution happens client-side via the
-    // template; the gateway just sees one body per chunk. (This is
-    // the existing /api/v1/sms contract; widening it to per-row
-    // messages is out of scope.)
+    // template; the gateway just sees one body per chunk.
     const dates = chunk.map((c) => dayjs(c.absentDate).format('YYYY-MM-DD'));
     const primaryDate = dates[0];
     const sampleName = chunk[0].name;
-    const body = config.message
-      .replaceAll('{studentName}', sampleName)
-      .replaceAll('{classDate}', primaryDate);
+    const body = ABSENT_WARNING_MESSAGE.replaceAll(
+      '{studentName}',
+      sampleName,
+    ).replaceAll('{classDate}', primaryDate);
 
     const result = await SmsService.sendSmsToDB(
       {
@@ -269,8 +256,8 @@ const runForTargets = async (
 
   return {
     sent,
-    skipped,
-    total: recipients.length,
+    skipped: skipped + skippedNoFatherMobile.length,
+    total: recipients.length + skippedNoFatherMobile.length,
     datesProcessed: targetDates,
   };
 };
@@ -278,6 +265,6 @@ const runForTargets = async (
 export const AbsentWarningService = {
   getAbsentPickerFromDB,
   runAbsentWarningJobFromDB,
-  // exposed for the scheduler
+  // exposed for the scheduler + manual back-fill route
   runForTargets,
 };

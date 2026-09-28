@@ -32,6 +32,19 @@ router.get(
   CourseController.getCourseById,
 );
 
+// Per-slot seat-cap read-out. Used by the admit-form picker to disable
+// full (batchDay, batchTime) slots. `/:id/seats` does not shadow `/:id`
+// since Express matches path segments distinctly. Cached for 60s —
+// admits don't change `totalSeats`, so stale-by-up-to-1m is fine, and
+// `clearCourseCache()` clears this on every course write.
+router.get(
+  '/:id/seats',
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
+  cache(60),
+  validateRequest(CourseValidation.idParamSchema),
+  CourseController.getCourseSeats,
+);
+
 router.patch(
   '/:id',
   Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
