@@ -1,3 +1,5 @@
+/* eslint-disable no-unused-vars */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import httpStatus from 'http-status';
 import bcrypt from 'bcrypt';
 import dayjs from 'dayjs';
@@ -36,9 +38,7 @@ export type TEnrollExistingStudent = {
  * output for direct array membership tests.
  */
 const weekdayNameFor = (d: Date): string =>
-  ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][
-    d.getDay()
-  ];
+  ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()];
 
 /**
  * Normalise an optional stringly-typed payload field to a real `null`
@@ -49,7 +49,7 @@ const weekdayNameFor = (d: Date): string =>
  * type (BloodGroup / string / number) instead of widening to
  * `string | number | null`.
  */
-const nullIfEmpty = <T,>(v: T | undefined | null): T | null => {
+const nullIfEmpty = <T>(v: T | undefined | null): T | null => {
   if (v === undefined || v === null) return null;
   if (typeof v === 'string' && v.trim() === '') return null;
   return v as T;
@@ -63,8 +63,7 @@ const nullIfEmpty = <T,>(v: T | undefined | null): T | null => {
  * shapes here so scenario toggles like `hasDue` and `activeCoursesOnly`
  * actually take effect.
  */
-const isTruthyQuery = (v: unknown): boolean =>
-  v === true || v === 'true' || v === '1' || v === 1;
+const isTruthyQuery = (v: unknown): boolean => v === true || v === 'true' || v === '1' || v === 1;
 
 const studentInclude = {
   user: {
@@ -203,11 +202,7 @@ const resolveBatchDayForCourse = async (
   // (`Course.totalSeats`) is set on the Courses page; the per-slot
   // count is derived from `StudentBatch` rows.
   if (course.totalSeats != null) {
-    const enrolled = await countEnrolledForSlot(
-      tx,
-      matchingBatchDay.id,
-      batchTime,
-    );
+    const enrolled = await countEnrolledForSlot(tx, matchingBatchDay.id, batchTime);
     if (enrolled >= course.totalSeats) {
       throw new AppError(
         httpStatus.CONFLICT,
@@ -233,10 +228,7 @@ const resolveBatchDayForCourse = async (
  *   - 409 if the student is already enrolled in this course.
  *   - 400 if the batch day / time don't belong to the chosen course.
  */
-const enrollExistingStudentToDB = async (
-  payload: TEnrollExistingStudent,
-  user: JwtPayload,
-) => {
+const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: JwtPayload) => {
   // Wrap the entire body in a single transaction so the seat-cap gate's
   // SELECT … FOR UPDATE lock is held until the StudentCourse +
   // StudentBatch writes commit. resolveBatchDayForCourse requires `tx`
@@ -271,10 +263,7 @@ const enrollExistingStudentToDB = async (
       },
     });
     if (alreadyEnrolled) {
-      throw new AppError(
-        httpStatus.CONFLICT,
-        'This student is already enrolled in this course',
-      );
+      throw new AppError(httpStatus.CONFLICT, 'This student is already enrolled in this course');
     }
 
     // Gate: a student may not enroll in another course while they have
@@ -683,9 +672,7 @@ const getAllStudentsFromDB = async (
       });
       const lowerWeekday = weekday.toLowerCase();
       matchingBatchDayIds = matchingBatchDays
-        .filter((b) =>
-          b.days.some((d) => d.toLowerCase() === lowerWeekday),
-        )
+        .filter((b) => b.days.some((d) => d.toLowerCase() === lowerWeekday))
         .map((b) => b.id);
     }
 
@@ -705,9 +692,7 @@ const getAllStudentsFromDB = async (
       const batchWhere: Prisma.StudentBatchWhereInput = {
         isDeleted: false,
         ...(courseId ? { batchDayRel: { courseId } } : {}),
-        ...(matchingBatchDayIds !== null
-          ? { batchDayId: { in: matchingBatchDayIds } }
-          : {}),
+        ...(matchingBatchDayIds !== null ? { batchDayId: { in: matchingBatchDayIds } } : {}),
         ...(classTime ? { batchTime: classTime } : {}),
       };
       andConditions.push({ batches: { some: batchWhere } });
@@ -829,28 +814,21 @@ const getAllStudentsFromDB = async (
   // PENDING. This mirrors the dashboard's bucketing rules.
   const dataWithStatus = data.map((s) => {
     const enrollments = s.studentCourses ?? [];
-    const totalFee = enrollments.reduce(
-      (sum, sc) => sum + Number(sc.course?.fee ?? 0),
-      0,
-    );
+    const totalFee = enrollments.reduce((sum, sc) => sum + Number(sc.course?.fee ?? 0), 0);
     const totalPaid = enrollments.reduce(
-      (sum, sc) =>
-        sum +
-        (sc.payments ?? []).reduce((p, pay) => p + Number(pay.amount), 0),
+      (sum, sc) => sum + (sc.payments ?? []).reduce((p, pay) => p + Number(pay.amount), 0),
       0,
     );
     const totalDue = Math.max(0, totalFee - totalPaid);
-    const activeStatuses = enrollments.map(
-      (sc) => sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
-    );
+    const activeStatuses = enrollments.map((sc) => sc.status as 'PENDING' | 'PARTIAL' | 'PAID');
     const status: 'PENDING' | 'PARTIAL' | 'PAID' =
       activeStatuses.length === 0
         ? 'PENDING'
         : activeStatuses.every((st) => st === 'PAID')
-        ? 'PAID'
-        : activeStatuses.some((st) => st === 'PARTIAL')
-        ? 'PARTIAL'
-        : 'PENDING';
+          ? 'PAID'
+          : activeStatuses.some((st) => st === 'PARTIAL')
+            ? 'PARTIAL'
+            : 'PENDING';
     const coursePaymentStatuses = enrollments.map((sc) => ({
       studentCourseId: sc.id,
       courseName: sc.course?.name ?? 'Course',
@@ -895,28 +873,21 @@ const getStudentByIdFromDB = async (id: string) => {
   // overrides are reflected. See getAllStudentsFromDB for the full
   // bucketing rules.
   const enrollments = student.studentCourses ?? [];
-  const totalFee = enrollments.reduce(
-    (sum, sc) => sum + Number(sc.course.fee),
-    0,
-  );
+  const totalFee = enrollments.reduce((sum, sc) => sum + Number(sc.course.fee), 0);
   const totalPaid = enrollments.reduce(
-    (sum, sc) =>
-      sum +
-      (sc.payments ?? []).reduce((p, pay) => p + Number(pay.amount), 0),
+    (sum, sc) => sum + (sc.payments ?? []).reduce((p, pay) => p + Number(pay.amount), 0),
     0,
   );
   const totalDue = Math.max(0, totalFee - totalPaid);
-  const activeStatuses = enrollments.map(
-    (sc) => sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
-  );
+  const activeStatuses = enrollments.map((sc) => sc.status as 'PENDING' | 'PARTIAL' | 'PAID');
   const status: 'PENDING' | 'PARTIAL' | 'PAID' =
     activeStatuses.length === 0
       ? 'PENDING'
       : activeStatuses.every((st) => st === 'PAID')
-      ? 'PAID'
-      : activeStatuses.some((st) => st === 'PARTIAL')
-      ? 'PARTIAL'
-      : 'PENDING';
+        ? 'PAID'
+        : activeStatuses.some((st) => st === 'PARTIAL')
+          ? 'PARTIAL'
+          : 'PENDING';
   const coursePaymentStatuses = enrollments.map((sc) => ({
     studentCourseId: sc.id,
     courseName: sc.course.name,
@@ -944,20 +915,21 @@ const updateStudentInDB = async (id: string, payload: TUpdateStudent['body'], us
   // Optional / nullable fields use `nullIfEmpty` so missing OR empty-
   // string payloads both clear the column (rather than storing "").
   if (payload.motherName !== undefined) data.motherName = nullIfEmpty(payload.motherName);
-  if (payload.motherOccupation !== undefined) data.motherOccupation = nullIfEmpty(payload.motherOccupation);
+  if (payload.motherOccupation !== undefined)
+    data.motherOccupation = nullIfEmpty(payload.motherOccupation);
   if (payload.motherMobile !== undefined) data.motherMobile = nullIfEmpty(payload.motherMobile);
-  if (payload.addressVillage !== undefined) data.addressVillage = nullIfEmpty(payload.addressVillage);
-  if (payload.addressPostOffice !== undefined) data.addressPostOffice = nullIfEmpty(payload.addressPostOffice);
+  if (payload.addressVillage !== undefined)
+    data.addressVillage = nullIfEmpty(payload.addressVillage);
+  if (payload.addressPostOffice !== undefined)
+    data.addressPostOffice = nullIfEmpty(payload.addressPostOffice);
   if (payload.addressUpozila !== undefined) data.addressUpozila = payload.addressUpozila;
   if (payload.addressDistrict !== undefined) data.addressDistrict = payload.addressDistrict;
   if (payload.sscInstitute !== undefined) data.sscInstitute = payload.sscInstitute;
   if (payload.sscBoard !== undefined) data.sscBoard = nullIfEmpty(payload.sscBoard);
-  if (payload.sscPassingYear !== undefined) data.sscPassingYear = nullIfEmpty(payload.sscPassingYear);
+  if (payload.sscPassingYear !== undefined)
+    data.sscPassingYear = nullIfEmpty(payload.sscPassingYear);
   if (payload.sscGpa !== undefined) {
-    data.sscGpa =
-      payload.sscGpa === null
-        ? null
-        : new Prisma.Decimal(payload.sscGpa);
+    data.sscGpa = payload.sscGpa === null ? null : new Prisma.Decimal(payload.sscGpa);
   }
 
   const result = await prisma.$transaction(async (tx) => {
