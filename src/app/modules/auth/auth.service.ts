@@ -60,6 +60,10 @@ const signInUserToDB = async (payload: TLogin) => {
     name: user.name,
     role: user.role as TUserRole,
     studentId: user.studentId,
+    // Surface the free-account flag in the access token so the frontend
+    // can route free users straight to /dashboard/free-classes. Defaults
+    // to false for paid/admin accounts (column default).
+    isFreeAccount: user.isFreeAccount,
   };
 
   const accessToken = generateAccessToken(tokenPayload);
@@ -84,6 +88,7 @@ const signInUserToDB = async (payload: TLogin) => {
       name: user.name,
       role: user.role,
       mustChangePassword: user.mustChangePassword,
+      isFreeAccount: user.isFreeAccount,
     },
     accessToken,
     refreshToken,
@@ -116,6 +121,7 @@ const refreshTokenToDB = async (tokenFromBody?: string, cookieToken?: string) =>
     name: user.name,
     role: user.role as TUserRole,
     studentId: user.studentId,
+    isFreeAccount: user.isFreeAccount,
   });
 
   return { accessToken };

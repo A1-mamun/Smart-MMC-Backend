@@ -344,6 +344,40 @@ const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: 
       },
     });
 
+    // Free → paid flip. When an admin admits a free-class student to a
+    // paid course, we retire their free-account lifecycle flags but
+    // preserve `freeSignupAt` for marketing audit. `mustChangePassword`
+    // intentionally stays false — the student keeps using their mobile
+    // as the password so they're not surprised by a forced reset.
+    if (existingStudent.isFreeAccount) {
+      const now = new Date();
+      await tx.student.update({
+        where: { id: existingStudent.id },
+        data: { isFreeAccount: false, freeConvertedAt: now },
+      });
+      await tx.user.update({
+        where: { id: existingStudent.userId },
+        data: { isFreeAccount: false, freeConvertedAt: now },
+      });
+      await tx.activityLog.create({
+        data: {
+          actorId: user.userId,
+          actorRole: user.role as 'SUPER_ADMIN' | 'ADMIN',
+          action: 'FREE_STUDENT_CONVERTED',
+          entityType: 'Student',
+          entityId: existingStudent.id,
+          description: `Free student "${existingStudent.user.name}" (${existingStudent.user.studentId}) converted to paid course "${course.name}"`,
+          metadata: {
+            studentId: existingStudent.id,
+            courseId: course.id,
+            courseName: course.name,
+            hscBatch: course.hscBatch,
+            intakeMode: existingStudent.intakeMode,
+          },
+        },
+      });
+    }
+
     const result = await tx.student.findUnique({
       where: { id: existingStudent.id },
       include: studentInclude,
@@ -556,6 +590,12 @@ const getAllStudentsFromDB = async (
     hasDue,
     activeCoursesOnly,
     absentOnDate,
+    // Free vs paid segregation. `isFreeAccount` is tri-state on the
+    // query side: undefined → no filter (returns everyone); true →
+    // marketer roster (free-only); false → paid dashboard default.
+    // Paid dashboards pass false explicitly so free-class accounts never
+    // pollute the operations view.
+    isFreeAccount,
     // The absent-warning picker + run-now pass `limit`/`page` inside
     // `filters` (not just in `options`); strip them so they don't slip
     // into the WHERE clause as raw where-input keys.
@@ -570,6 +610,10 @@ const getAllStudentsFromDB = async (
   // console.log('options:', options);
 
   const andConditions: Prisma.StudentWhereInput[] = [{ isDeleted: false }];
+
+  if (isFreeAccount !== undefined) {
+    andConditions.push({ isFreeAccount });
+  }
 
   if (searchTerm) {
     andConditions.push({

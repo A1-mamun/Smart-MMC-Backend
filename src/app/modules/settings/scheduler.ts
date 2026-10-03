@@ -1,8 +1,13 @@
+/* eslint-disable @typescript-eslint/no-unused-vars, no-unused-vars */
+// The cron / absent / exam-absence imports below are only used by the
+// disabled auto-SMS code. Parked while the auto path is off; remove the
+// disable comment when re-enabling.
 import cron, { type ScheduledTask } from 'node-cron';
 import dayjs from 'dayjs';
 import { SettingsService } from './settings.service';
 import { AbsentWarningService } from '../absentWarning/absentWarning.service';
 import { ExamAbsenceWarningService } from '../examAbsenceWarning/examAbsenceWarning.service';
+/* eslint-enable @typescript-eslint/no-unused-vars, no-unused-vars */
 import config from '../../config';
 
 let absentTask: ScheduledTask | null = null;
@@ -11,7 +16,9 @@ let examTask: ScheduledTask | null = null;
 // In-process "fired-this-minute" latches so a slow tick cannot double-fire
 // within the same minute window. We deliberately do NOT persist these —
 // on process restart the scheduler resumes from the next minute slot.
+/* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
 let absentLastFiredKey = '';
+/* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
 let examLastFiredKey = '';
 
 /**
@@ -25,6 +32,13 @@ let examLastFiredKey = '';
  *      (hour, minute) and processes every absent examinee whose exam
  *      was `delayDays` ago.
  *
+ * DISABLED 2026-10-01 per user request: automatic SMS sending is
+ * temporarily turned off. Both cron tasks below are preserved inside
+ * the comment block for easy re-enable. The exports (`startAllSchedulers`,
+ * `startAbsentWarningScheduler`, `stopAllSchedulers`,
+ * `stopAbsentWarningScheduler`) stay live as no-ops so server.ts and
+ * any tooling keep working.
+ *
  * Skipped when `config.node_env === 'test'` so `pnpm build` and CI runs
  * don't drag in cron state.
  */
@@ -32,7 +46,8 @@ export const startAllSchedulers = () => {
   if (absentTask || examTask) return;
   if (config.node_env === 'test') return;
 
-  // ----- absent-warning tick (always-on, today only) -----
+  // ----- absent-warning tick (DISABLED — preserved for re-enable) -----
+  /*
   absentTask = cron.schedule(
     '* * * * *',
     async () => {
@@ -63,7 +78,7 @@ export const startAllSchedulers = () => {
     },
   );
 
-  // ----- exam-absence tick (unchanged) -----
+  // ----- exam-absence tick (DISABLED — preserved for re-enable) -----
   examTask = cron.schedule(
     '* * * * *',
     async () => {
@@ -100,6 +115,14 @@ export const startAllSchedulers = () => {
   );
 
   console.log('Schedulers registered ✓ (absent-warning, exam-absence)');
+  */
+  void cron;
+  void dayjs;
+  void SettingsService;
+  // Auto-SMS is parked. Manual triggers via the /settings/* POST
+  // endpoints still work — they hit the no-op service stubs and
+  // return clean "0 sent" responses.
+  console.log('Schedulers parked ✓ (auto-SMS disabled per request)');
 };
 
 /**

@@ -36,3 +36,17 @@ export const passwordResetRateLimiter: RateLimitRequestHandler = rateLimit({
   standardHeaders: 'draft-8',
   legacyHeaders: false,
 });
+
+// Tighter cap on free-class signup so the public form isn't abused to
+// spam the User/Student tables. 5/hr is plenty for a real student retrying
+// after a network blip.
+export const freeClassRateLimiter: RateLimitRequestHandler = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many free-class signup attempts from this IP. Try later.',
+  },
+});

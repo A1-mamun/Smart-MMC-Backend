@@ -160,6 +160,10 @@ const getAllStudentsSchema = z.object({
     scenarioCourses: z.string().optional(),
     hasDue: z.coerce.boolean().optional(),
     activeCoursesOnly: z.coerce.boolean().optional(),
+    // Free-vs-paid segregation. Paid dashboards pass `false` to hide
+    // free-class accounts; the marketer view passes `true`; leaving it
+    // unset returns everyone.
+    isFreeAccount: z.coerce.boolean().optional(),
     // ISO yyyy-mm-dd — server resolves to "students enrolled in a
     // class on this weekday MINUS students with an Attendance row on
     // this date". Used by the absent-warning SMS picker on

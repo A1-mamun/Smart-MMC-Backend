@@ -49,10 +49,18 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next) => {
         errorSources = f.errorSources;
         break;
       default:
-        const v = handleValidationError();
+        const v = handleValidationError(err);
         statusCode = v.statusCode;
         message = v.message;
         errorSources = v.errorSources;
+        // _devDetail is only populated for the catch-all Prisma handler;
+        // surface it in dev so the toast can show what Prisma actually
+        // complained about (missing column, null constraint, etc.).
+        if ((v as { _devDetail?: string })._devDetail) {
+          (errorSources[0] as { _devDetail?: string })._devDetail = (
+            v as { _devDetail?: string }
+          )._devDetail;
+        }
         break;
     }
   } else if (err instanceof AppError) {
@@ -79,6 +87,13 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next) => {
     success: false,
     message,
     errorSources,
+    // Dev-only debug metadata: surfaces the Prisma code/meta for the
+    // catch-all handler so debugging "Invalid provider data" toasts
+    // doesn't require tailing backend logs.
+    devDetail:
+      config.node_env === 'development'
+        ? (errorSources[0] as { _devDetail?: string })._devDetail ?? null
+        : null,
     stack: config.node_env === 'development' ? err?.stack : null,
   });
 };

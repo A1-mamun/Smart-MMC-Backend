@@ -1,9 +1,22 @@
+// The imports below are only used by the auto-send logic that is temporarily
+// disabled (see chunkAndSend + runForDate + runJobFromDB). The
+// eslint-disable on each line keeps the lint green while the code is
+// parked; remove the disable comment when re-enabling.
+/* eslint-disable @typescript-eslint/no-unused-vars, no-unused-vars */
 import dayjs from 'dayjs';
-import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
+import { SettingsService } from '../settings/settings.service';
+/*
+import { JwtPayload } from 'jsonwebtoken';
 import { SmsService } from '../sms/sms.service';
 import { toIntl } from '../../utils/phone';
-import { SettingsService } from '../settings/settings.service';
+*/
+/* eslint-enable @typescript-eslint/no-unused-vars, no-unused-vars */
+
+// Mark `dayjs` as in-use so lint stays happy while the auto-send code
+// is disabled. The `typeof` reference doesn't invoke the function.
+// Remove this no-op when re-enabling.
+void typeof dayjs;
 
 type TJobResult = {
   /** Total recipients the gateway accepted across all exams processed. */
@@ -43,8 +56,11 @@ type TJobResult = {
  * shape back to the frontend toast.
  */
 
+/* eslint-disable @typescript-eslint/no-unused-vars, no-unused-vars */
+// `chunkAndSend` is preserved for the re-enable path; while the auto-send
+// code is disabled nothing calls it. Remove this disable when re-enabling.
 const chunkAndSend = async (
-  recipients: {
+  _recipients: {
     studentId: string;
     name: string;
     intl: string;
@@ -53,10 +69,23 @@ const chunkAndSend = async (
     examDateYmd: string;
     absentDate: Date;
   }[],
-  messageTemplate: string,
-  actorId: string,
-  actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
+  _messageTemplate: string,
+  _actorId: string,
+  _actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
 ): Promise<{ sent: number; skipped: number }> => {
+  // ============================================================================
+  // DISABLED: Automatic SMS sending is temporarily turned off per user request
+  // (2026-10-01). The original implementation is preserved in the comment
+  // block below for easy re-enable. Routes/controllers stay so manual admin
+  // triggers (curl/Postman) still hit a working endpoint that returns a
+  // clean no-op.
+  // ============================================================================
+  void _recipients;
+  void _messageTemplate;
+  void _actorId;
+  void _actorRole;
+  return { sent: 0, skipped: 0 };
+  /*
   let sent = 0;
   let skipped = 0;
 
@@ -108,13 +137,26 @@ const chunkAndSend = async (
     });
   }
   return { sent, skipped };
+  */
 };
-
+/* eslint-enable @typescript-eslint/no-unused-vars, no-unused-vars */
 const runForDate = async (
-  targetDate: Date,
-  actorId: string,
-  actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
+  _targetDate: Date,
+  _actorId: string,
+  _actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
 ): Promise<TJobResult> => {
+  // ============================================================================
+  // DISABLED: Automatic SMS sending is temporarily turned off per user request
+  // (2026-10-01). The original implementation is preserved in the comment
+  // block below for easy re-enable. Routes/controllers stay so manual admin
+  // triggers (curl/Postman) still hit a working endpoint that returns a
+  // clean no-op.
+  // ============================================================================
+  void _targetDate;
+  void _actorId;
+  void _actorRole;
+  return { sent: 0, skipped: 0, total: 0, examsProcessed: [] };
+  /*
   const cfg = (await SettingsService.getConfigFromDB()).examAbsence;
   if (!cfg.enabled) {
     return { sent: 0, skipped: 0, total: 0, examsProcessed: [] };
@@ -228,12 +270,24 @@ const runForDate = async (
       examDate: dayjs(e.examDate).format('YYYY-MM-DD'),
     })),
   };
+  */
 };
 
 const runJobFromDB = async (
-  actorId: string,
-  actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
+  _actorId: string,
+  _actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
 ): Promise<TJobResult> => {
+  // ============================================================================
+  // DISABLED: Automatic SMS sending is temporarily turned off per user request
+  // (2026-10-01). The original implementation is preserved in the comment
+  // block below for easy re-enable. Routes/controllers stay so manual admin
+  // triggers (curl/Postman) still hit a working endpoint that returns a
+  // clean no-op.
+  // ============================================================================
+  void _actorId;
+  void _actorRole;
+  return { sent: 0, skipped: 0, total: 0, examsProcessed: [] };
+  /*
   const cfg = (await SettingsService.getConfigFromDB()).examAbsence;
   if (!cfg.enabled) {
     return { sent: 0, skipped: 0, total: 0, examsProcessed: [] };
@@ -245,6 +299,7 @@ const runJobFromDB = async (
     .startOf('day')
     .toDate();
   return runForDate(targetDate, actorId, actorRole);
+  */
 };
 
 export const ExamAbsenceWarningService = {

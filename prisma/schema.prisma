@@ -93,6 +93,17 @@ enum ExamSectionType {
   WRITTEN
 }
 
+enum StudentIntakeMode {
+  ONLINE
+  OFFLINE
+}
+
+enum FreeContentProvider {
+  YOUTUBE
+  VDOCIPHER
+  FILE
+}
+
 model User {
   id                 String     @id @default(uuid())
   studentId          String     @unique
@@ -112,6 +123,16 @@ model User {
   passwordChangedAt  DateTime?
   passwordLevel      Int        @default(0)
   mustChangePassword Boolean    @default(true)
+  // Free-class lifecycle flags. A User is created via /free-class/signup
+  // with isFreeAccount=true (and the mobile bcrypt'd as the password).
+  // When an admin admits them to a paid course, the student.service flips
+  // isFreeAccount=false and stamps freeConvertedAt — freeSignupAt stays
+  // set so the marketing team can still see when they originally signed
+  // up via the free funnel.
+  isFreeAccount      Boolean           @default(false)
+  freeSignupAt       DateTime?
+  freeSignupSource   StudentIntakeMode?
+  freeConvertedAt    DateTime?
   isDeleted          Boolean    @default(false)
   deletedAt          DateTime?
   deletedBy          String?
@@ -134,6 +155,7 @@ model User {
   @@index([role])
   @@index([status])
   @@index([isDeleted])
+  @@index([isFreeAccount])
   @@map("users")
 }
 
@@ -162,6 +184,17 @@ model Student {
   sscBoard        EducationBoard?
   sscPassingYear  Int?
   sscGpa          Decimal?       @db.Decimal(4, 2)
+  // Free-class signup captures a lightweight subset of fields and gets
+  // placeholder strings ("FREE-pending" / "00000000000") for the NOT NULL
+  // parent / SSC columns above. The admin fills in the real values via
+  // EditStudentForm *before* admitting the student to a paid course.
+  intakeMode       StudentIntakeMode @default(ONLINE)
+  isFreeAccount    Boolean            @default(false)
+  freeSignupAt     DateTime?
+  freeConvertedAt  DateTime?
+  freeHscBatch     HscBatch?
+  freeDistrict     String?
+  freeUpazila      String?
   admittedAt      DateTime       @default(now())
   admittedBy      String
   isDeleted       Boolean        @default(false)
@@ -179,11 +212,14 @@ model Student {
   examResults   ExamResult[]
   weeklyAbsentWarnings WeeklyAbsentWarning[]
   examAbsenceWarnings ExamAbsenceWarning[]
+  freeContentViews  FreeContentView[]
 
   @@index([addressDistrict])
   @@index([sscPassingYear])
   @@index([admittedBy])
   @@index([isDeleted])
+  @@index([isFreeAccount])
+  @@index([intakeMode])
   @@map("students")
 }
 
@@ -601,4 +637,94 @@ model ExamAbsenceWarning {
   @@index([studentId])
   @@index([warnedAt])
   @@map("exam_absence_warnings")
+}
+
+// ─── Free Classes ────────────────────────────────────────────────────────
+// Content tree for the public "Free Classes" funnel. Topics store enough
+// provider info to swap from YouTube (v1) to VdoCipher / FILE (v2) without
+// UI rewrites — the GET /free-class/content/:topicId/play endpoint is the
+// single integration point that returns a discriminated `TFreePlayback`.
+
+model FreeSubject {
+  id          String   @id @default(uuid())
+  // Tab label, e.g. "HSC 1st Paper" / "HSC 2nd Paper". Admin-curated.
+  name        String   @db.VarChar(100)
+  position    Int      @default(0)
+  isPublished Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  chapters FreeChapter[]
+
+  @@index([position])
+  @@index([isPublished])
+  @@map("free_subjects")
+}
+
+model FreeChapter {
+  id          String   @id @default(uuid())
+  subjectId   String
+  title       String   @db.VarChar(200)
+  position    Int      @default(0)
+  // 1-based, admin-supplied. Drives the sort order (chapterNumber=1
+  // shows first) AND is enforced unique per subject via the unique
+  // index below. Admin can leave gaps (e.g. 1, 3 — chapter 2 is
+  // intentionally skipped) so they can reserve future slots.
+  chapterNumber Int?    @db.SmallInt
+  isPublished Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  subject FreeSubject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  topics  FreeTopic[]
+
+  @@unique([subjectId, chapterNumber])
+  @@index([subjectId, position])
+  @@index([isPublished])
+  @@map("free_chapters")
+}
+
+model FreeTopic {
+  id          String  @id @default(uuid())
+  chapterId   String
+  title       String  @db.VarChar(200)
+  position    Int     @default(0)
+
+  // Provider + raw id. The /free-class/content endpoint SELECTs these out
+  // so they never reach the wire — only /free-class/content/:id/play can
+  // mint an embed URL using them.
+  provider         FreeContentProvider
+  providerVideoId  String @db.VarChar(200)
+  providerEmbedUrl String? @db.Text   // optional cached embed URL
+  vdoCipherOtp     String? @db.Text   // paid-flow OTP cache (unused in v1)
+  durationSeconds  Int?
+  thumbnailUrl     String? @db.Text
+  isPublished      Boolean @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  chapter FreeChapter @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  views   FreeContentView[]
+
+  @@index([chapterId, position])
+  @@index([isPublished])
+  @@map("free_topics")
+}
+
+// Continue-watching ledger. v1 just records the play timestamp; later we
+// can add "resume at watchedSeconds" once the player emits timeupdates.
+model FreeContentView {
+  id             String   @id @default(uuid())
+  topicId        String
+  studentId      String
+  lastViewedAt   DateTime @default(now())
+  watchedSeconds Int      @default(0)
+
+  topic   FreeTopic @relation(fields: [topicId],   references: [id], onDelete: Cascade)
+  student Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([topicId, studentId])
+  @@index([studentId])
+  @@index([lastViewedAt])
+  @@map("free_content_views")
 }

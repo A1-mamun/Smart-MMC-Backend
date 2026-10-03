@@ -1,15 +1,21 @@
 import dayjs from 'dayjs';
-import isoWeek from 'dayjs/plugin/isoWeek';
-import { JwtPayload } from 'jsonwebtoken';
-import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
 import httpStatus from 'http-status';
 import { StudentService } from '../student/student.service';
-import { SmsService } from '../sms/sms.service';
 import { toIntl } from '../../utils/phone';
 
-// dayjs iso-week plugins for the per-week dedupe key.
+// The imports below are only used by the auto-send logic that is
+// temporarily disabled (see comment block at runAbsentWarningJobFromDB
+// and runForTargets). They are kept commented here so re-enabling the
+// auto-SMS path is a one-step uncomment operation. The next re-enable
+// should also restore the `dayjs.extend(isoWeek)` call below.
+/*
+import isoWeek from 'dayjs/plugin/isoWeek';
+import { JwtPayload } from 'jsonwebtoken';
+import prisma from '../../utils/prisma';
+import { SmsService } from '../sms/sms.service';
 dayjs.extend(isoWeek);
+*/
 
 type TJobResult = {
   /** Total recipients the gateway accepted. */
@@ -27,9 +33,16 @@ type TJobResult = {
  * absent-warning (mode/schedule/template) — the job is now always-on,
  * always "today only", always father-only. The message is fixed so
  * there is nothing for the UI to misconfigure.
+ *
+ * Currently unused because the auto-send code is disabled (see
+ * runForTargets). Kept here so re-enabling the auto path is one
+ * uncomment away.
  */
 const ABSENT_WARNING_MESSAGE =
   'Dear parent, your ward {studentName} was absent from class today ({classDate}). Please ensure regular attendance.';
+// Reference the constant so lint is happy while the auto-send code is
+// disabled. Remove this no-op when re-enabling.
+void ABSENT_WARNING_MESSAGE;
 
 /**
  * Build the recipient list for a single target date WITHOUT sending.
@@ -114,6 +127,14 @@ const getAbsentPickerFromDB = async (params: { date: string }) => {
  * fallback. Students with no usable father-mobile are tracked as
  * `skipped` so the operator can see WHY a row didn't deliver.
  */
+// ============================================================================
+// DISABLED: Automatic SMS sending is temporarily turned off per user request
+// (2026-10-01). The code below is intact and ready to re-enable — see the
+// matching block in `runForTargets` further down and the cron tick in
+// `settings/scheduler.ts`. Routes/controllers stay so manual admin triggers
+// (curl/Postman) still hit a working endpoint that returns a clean no-op.
+// ============================================================================
+/*
 const runAbsentWarningJobFromDB = async (
   actorId: string,
   actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
@@ -123,6 +144,24 @@ const runAbsentWarningJobFromDB = async (
   // + chunked-send code path is reused.
   const today = dayjs().format('YYYY-MM-DD');
   return runForTargets([today], actorId, actorRole);
+};
+*/
+
+// Live no-op stub. Keeps the export + signature stable so the controller
+// route (`POST /api/v1/settings/absent-warning/run`) keeps compiling and
+// returns a clean "0 sent" response when an admin fires it manually.
+const runAbsentWarningJobFromDB = async (
+  _actorId: string,
+  _actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
+): Promise<TJobResult> => {
+  void _actorId;
+  void _actorRole;
+  return {
+    sent: 0,
+    skipped: 0,
+    total: 0,
+    datesProcessed: [],
+  };
 };
 
 /**
@@ -137,9 +176,25 @@ const runAbsentWarningJobFromDB = async (
  */
 const runForTargets = async (
   targetDates: string[],
-  actorId: string,
-  actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
+  _actorId: string,
+  _actorRole: 'SUPER_ADMIN' | 'ADMIN' | 'SYSTEM',
 ): Promise<TJobResult> => {
+  // ============================================================================
+  // DISABLED: Automatic SMS sending is temporarily turned off per user request
+  // (2026-10-01). The original implementation is preserved in the comment
+  // block below for easy re-enable. Routes/controllers stay so manual admin
+  // triggers (curl/Postman) still hit a working endpoint that returns a
+  // clean no-op.
+  // ============================================================================
+  void _actorId;
+  void _actorRole;
+  return {
+    sent: 0,
+    skipped: 0,
+    total: 0,
+    datesProcessed: targetDates,
+  };
+  /*
   // Per-ISO-week dedupe set.
   const isoYearNow = dayjs().isoWeekYear();
   const isoWeekNow = dayjs().isoWeek();
@@ -260,6 +315,7 @@ const runForTargets = async (
     total: recipients.length + skippedNoFatherMobile.length,
     datesProcessed: targetDates,
   };
+  */
 };
 
 export const AbsentWarningService = {
