@@ -158,12 +158,32 @@ const getAllStudentsSchema = z.object({
     classDate: z.coerce.date().optional(),
     classTime: z.string().optional(),
     scenarioCourses: z.string().optional(),
-    hasDue: z.coerce.boolean().optional(),
-    activeCoursesOnly: z.coerce.boolean().optional(),
+    // NOTE: avoid `z.coerce.boolean()` here — RTK Query stringifies
+    // booleans to "true"/"false" before they reach the server, and
+    // `Boolean("false")` is `true`. The service layer already coerces
+    // these via `isTruthyQuery()`, which handles both real booleans and
+    // stringified "true"/"1", so we leave them as raw `unknown` here.
+    hasDue: z
+      .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+      .optional(),
+    activeCoursesOnly: z
+      .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+      .optional(),
     // Free-vs-paid segregation. Paid dashboards pass `false` to hide
     // free-class accounts; the marketer view passes `true`; leaving it
     // unset returns everyone.
-    isFreeAccount: z.coerce.boolean().optional(),
+    //
+    // IMPORTANT: do NOT use `z.coerce.boolean()` here. RTK Query stringifies
+    // every query param via `URLSearchParams.append(key, String(value))`, so
+    // the boolean `false` arrives as the literal string `"false"`. JS's
+    // `Boolean("false")` is `true` (non-empty string), which would flip the
+    // filter and silently show only free accounts on the paid Students page.
+    // Accept the four string shapes the frontend can produce ("true"/"false"
+    // stringified + actual booleans) and coerce to a real boolean ourselves.
+    isFreeAccount: z
+      .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+      .optional()
+      .transform((v) => (v === undefined ? undefined : v === true || v === 'true' || v === '1')),
     // ISO yyyy-mm-dd — server resolves to "students enrolled in a
     // class on this weekday MINUS students with an Attendance row on
     // this date". Used by the absent-warning SMS picker on

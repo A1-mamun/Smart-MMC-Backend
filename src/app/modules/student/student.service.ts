@@ -611,8 +611,47 @@ const getAllStudentsFromDB = async (
 
   const andConditions: Prisma.StudentWhereInput[] = [{ isDeleted: false }];
 
-  if (isFreeAccount !== undefined) {
-    andConditions.push({ isFreeAccount });
+  // Coerce `isFreeAccount` from its URL-stringified form to a real boolean.
+  // The validation middleware can't persist `.transform()` results because
+  // Express exposes `req.query` as a getter that re-parses the URL on every
+  // access, so any middleware-side coercion is silently discarded by the
+  // time the controller reads `req.query`. Doing it here, once, makes the
+  // boolean flow through the rest of the function untouched. (Mirrors the
+  // existing `isTruthyQuery` helper used for `hasDue` / `activeCoursesOnly`,
+  // but those flow through `if (isTruthyQuery(...))` rather than directly
+  // into a Prisma WHERE clause — so they don't need this fix.)
+  //
+  // The `isFreeAccount` parameter is typed as `boolean | undefined` because
+  // the Zod schema's `.transform()` returns a real boolean. We still keep
+  // the string / number comparisons so direct programmatic callers of this
+  // service (tests, internal scripts, sibling services that build the
+  // filter object manually from a raw `req.query` snapshot) don't break —
+  // they pass `"true"` / `"false"` / `1` / `0` straight through.
+  const isFreeAccountBool: boolean | undefined =
+    isFreeAccount === undefined
+      ? undefined
+      : isFreeAccount === true ||
+        (isFreeAccount as unknown) === 'true' ||
+        (isFreeAccount as unknown) === '1' ||
+        (isFreeAccount as unknown) === 1;
+
+  if (isFreeAccountBool !== undefined) {
+    andConditions.push({ isFreeAccount: isFreeAccountBool });
+    // Defense-in-depth for the free roster: even if the `isFreeAccount`
+    // flag is ever stale (failed transaction, backfilled row, future
+    // admit path that forgets the flip), a student with any active
+    // (non-deleted) StudentCourse enrollment is, by definition, a
+    // paying customer and must NEVER appear on the free list. We use
+    // `studentCourses: { none: { isDeleted: false } }` so soft-deleted
+    // historical enrollments don't keep a converted student pinned to
+    // the roster. Only applied on the `isFreeAccount === true` branch
+    // so the paid list (where enrolled-with-no-courses-yet is a valid
+    // transient state during admit) is unaffected.
+    if (isFreeAccountBool === true) {
+      andConditions.push({
+        studentCourses: { none: { isDeleted: false } },
+      });
+    }
   }
 
   if (searchTerm) {

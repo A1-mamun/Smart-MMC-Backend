@@ -20,6 +20,10 @@ const getAdminDashboardDataFromDB = async () => {
     // we fetch the (studentId, status) pairs and bucket in JS. This is bounded
     // by the number of active enrollments, not the number of students.
     paidEnrollmentCount,
+    // Free-class accounts (signed up only via /free-classes, no paid
+    // course enrolled). Surfaced as its own KPI on the admin dashboard
+    // so marketers can see how big their cold-lead pool is.
+    freeStudents,
   ] = await Promise.all([
     prisma.student.count({ where: { isDeleted: false } }),
     prisma.payment.aggregate({
@@ -52,6 +56,21 @@ const getAdminDashboardDataFromDB = async () => {
     }),
     prisma.studentCourse.count({
       where: { isDeleted: false, status: PaymentStatus.PAID },
+    }),
+    prisma.student.count({
+      // Free-class accounts that are NOT also enrolled in any active
+      // paid course. The `studentCourses: { none: { isDeleted: false } }`
+      // clause mirrors the filter on `getAllStudents?isFreeAccount=true`
+      // (see student.service.ts) so the dashboard KPI matches the free
+      // roster page exactly — admins should never see a number on the
+      // card that's different from what `/dashboard/free-students`
+      // returns. Catches any drift where a free account was admitted to
+      // a paid course without the `isFreeAccount` flag being flipped.
+      where: {
+        isDeleted: false,
+        isFreeAccount: true,
+        studentCourses: { none: { isDeleted: false } },
+      },
     }),
   ]);
 
@@ -123,6 +142,11 @@ const getAdminDashboardDataFromDB = async () => {
       totalDueAmount,
       todayAttendance,
       monthAttendance,
+      // Free-class account count. The paid students KPI excludes these
+      // (see Students.tsx — isFreeAccount: false is the default), so
+      // surfacing them separately on the dashboard lets admins see the
+      // cold-lead pool without polluting the operations view.
+      freeStudents,
     },
     paidEnrollmentCount,
     recentActivities,

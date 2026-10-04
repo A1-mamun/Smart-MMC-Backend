@@ -357,9 +357,13 @@ const getFreeTopicPlaybackFromDB = async (
 };
 
 /**
- * Convenience wrapper used by the controller: resolves the auth User.id
- * → Student.id (FreeContentView.studentId references Student, not User)
- * and forwards to the raw topic service.
+ * Convenience wrapper used by the controller for student callers:
+ * resolves the auth User.id → Student.id (FreeContentView.studentId
+ * references Student, not User) and forwards to the raw topic service.
+ *
+ * Admins go through `getFreeTopicPlaybackForAdminToDB` instead — they
+ * don't have a Student row and we don't want to pollute the
+ * FreeContentView ledger with admin previews.
  */
 const getFreeTopicPlaybackForUserToDB = async (
   topicId: string,
@@ -375,10 +379,47 @@ const getFreeTopicPlaybackForUserToDB = async (
   return getFreeTopicPlaybackFromDB(topicId, student.id);
 };
 
+/**
+ * Admin preview path. Returns the same playback payload as the student
+ * flow but does NOT resolve a Student row (admins don't have one) and
+ * does NOT write to FreeContentView. The whole point is "I just want to
+ * see what the student sees" without creating a fake student account.
+ */
+const getFreeTopicPlaybackForAdminToDB = async (topicId: string) => {
+  // Inline the topic lookup + playback dispatch so we don't touch the
+  // view ledger. Kept structurally identical to the student path so
+  // YouTube / VdoCipher / FILE behave the same.
+  const topic = await prisma.freeTopic.findUnique({ where: { id: topicId } });
+  if (!topic || !topic.isPublished) {
+    throw new AppError(httpStatus.NOT_FOUND, 'Topic not found');
+  }
+
+  switch (topic.provider) {
+    case 'YOUTUBE':
+      return {
+        provider: 'YOUTUBE' as const,
+        topicId: topic.id,
+        embedUrl: `https://www.youtube.com/embed/${topic.providerVideoId}`,
+        expiresAt: null,
+      };
+    case 'VDOCIPHER':
+      throw new AppError(
+        httpStatus.NOT_IMPLEMENTED,
+        'VdoCipher playback is coming soon',
+      );
+    case 'FILE':
+      throw new AppError(
+        httpStatus.NOT_IMPLEMENTED,
+        'File playback is coming soon',
+      );
+  }
+};
+
 export const FreeClassService = {
   signUpFreeStudentToDB,
   freeLoginToDB,
   getFreeContentFromDB,
   getFreeTopicPlaybackFromDB,
   getFreeTopicPlaybackForUserToDB,
+  getFreeTopicPlaybackForAdminToDB,
 };

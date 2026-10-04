@@ -67,8 +67,13 @@ const getAbsentPickerFromDB = async (params: { date: string }) => {
   // Reuse the existing cohort resolver — `absentOnDate` is part of
   // the getAllStudentsFromDB filter chain (subtracts Attendance rows
   // for the date automatically).
+  //
+  // `isFreeAccount: undefined` so the cohort includes both paid and
+  // free-class students — the absent-warning picker is an
+  // operations view, not a marketer view, and we want to remind
+  // students regardless of their enrollment category.
   const cohort = await StudentService.getAllStudentsFromDB(
-    { absentOnDate: targetDate, limit: 1000, page: 1 },
+    { absentOnDate: targetDate, isFreeAccount: undefined, limit: 1000, page: 1 },
     { page: 1, limit: 1000 },
   );
 

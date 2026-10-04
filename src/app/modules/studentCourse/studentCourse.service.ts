@@ -4,7 +4,7 @@ import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
 import { TEnroll } from './studentCourse.validation';
-import { clearCourseCache } from '../../utils/clearCache';
+import { clearCourseCache, clearStudentCache } from '../../utils/clearCache';
 import generateStudentId from '../../utils/generateStudentId';
 
 const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
@@ -33,6 +33,16 @@ const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
   // global per (hscBatch, yearDigit) prefix so two enrollments in two
   // courses with different year-digits get distinct IDs.
   const newStudentCourseId = await generateStudentId(course.hscBatch, course.name);
+
+  // Snapshot the pre-enrollment `isFreeAccount` state so the same
+  // free→paid flip that `student.service.ts` does at admit time also
+  // runs here. Without this, a free-class account enrolled via this
+  // lighter endpoint keeps `isFreeAccount = true` while holding an
+  // active `StudentCourse`, leaking into the `/dashboard/free-students`
+  // roster. Mirrors the admit path's lifecycle (see student.service.ts
+  // enrollExistingStudent — same flag flip, same `freeConvertedAt`
+  // stamp, same FREE_STUDENT_CONVERTED activity log entry).
+  const wasFree = student.isFreeAccount;
 
   const result = await prisma.$transaction(async (tx) => {
     let enrollment;
@@ -80,10 +90,48 @@ const enrollStudentToDB = async (payload: TEnroll, user: JwtPayload) => {
       },
     });
 
+    // Free → paid flip on the Student + User rows. Done in the same
+    // transaction so a failure rolls back the enrollment too — we never
+    // leave a half-paid student where the enrollment landed but the
+    // flag is still `true`.
+    if (wasFree) {
+      const now = new Date();
+      await tx.student.update({
+        where: { id: student.id },
+        data: { isFreeAccount: false, freeConvertedAt: now },
+      });
+      await tx.user.update({
+        where: { id: student.userId },
+        data: { isFreeAccount: false, freeConvertedAt: now },
+      });
+      await tx.activityLog.create({
+        data: {
+          actorId: user.userId,
+          actorRole: user.role as 'SUPER_ADMIN' | 'ADMIN',
+          action: 'FREE_STUDENT_CONVERTED',
+          entityType: 'Student',
+          entityId: student.id,
+          description: `Free student enrolled in paid course "${course.name}" via /student-course/enroll`,
+          metadata: {
+            studentId: student.id,
+            courseId: course.id,
+            courseName: course.name,
+            source: 'studentCourse.enrollStudentToDB',
+          },
+        },
+      });
+    }
+
     return enrollment;
   });
 
+  // BOTH caches must be cleared: the course-cache (seat counts) AND
+  // the student-cache (the /student list, which is cached at 60s and
+  // is what the free-students page reads). Without clearStudentCache,
+  // a freshly-converted free student lingers in the cached
+  // `?isFreeAccount=true` response for up to a minute.
   await clearCourseCache();
+  await clearStudentCache();
   return result;
 };
 
@@ -165,7 +213,11 @@ const unenrollFromDB = async (id: string, user: JwtPayload) => {
       deletedBy: user.userId,
     },
   });
+  // Clear both caches — the unenroll changes the student's enrollment
+  // state, which the cached /student list (free vs paid bucketing)
+  // depends on, and the seat-count aggregation.
   await clearCourseCache();
+  await clearStudentCache();
   return null;
 };
 

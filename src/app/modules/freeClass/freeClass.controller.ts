@@ -55,14 +55,21 @@ const getFreeContent = catchAsync(async (_req: Request, res: Response) => {
 });
 
 const getFreeTopicPlayback = catchAsync(async (req: Request, res: Response) => {
-  const userId = (req.user as { userId: string }).userId;
+  const user = req.user as { userId: string; role: 'STUDENT' | 'ADMIN' | 'SUPER_ADMIN' };
   const topicId = Array.isArray(req.params.topicId)
     ? req.params.topicId[0]
     : req.params.topicId;
-  const result = await FreeClassService.getFreeTopicPlaybackForUserToDB(
-    topicId,
-    userId,
-  );
+
+  // Admins (and super admins) preview the student experience without
+  // a Student row and without polluting the FreeContentView ledger —
+  // see getFreeTopicPlaybackForAdminToDB in the service for the
+  // rationale. STUDENT callers go through the full path that resolves
+  // their Student.id and upserts a view row.
+  const result =
+    user.role === 'STUDENT'
+      ? await FreeClassService.getFreeTopicPlaybackForUserToDB(topicId, user.userId)
+      : await FreeClassService.getFreeTopicPlaybackForAdminToDB(topicId);
+
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
