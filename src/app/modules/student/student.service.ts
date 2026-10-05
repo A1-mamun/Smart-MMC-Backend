@@ -176,11 +176,11 @@ const resolveBatchDayForCourse = async (
   if (!course.isActive) {
     throw new AppError(httpStatus.BAD_REQUEST, 'Selected course is not active');
   }
-  // A course marked complete by the admin has "graduated" — no new
-  // admits or re-enrollments are allowed. The frontend filters
-  // completed courses out of the picker, but we still guard here so a
-  // stale form payload (cached before the toggle) can't slip through.
-  if (course.isCompleted) {
+  // A course in the COMPLETE stage has "graduated" — no new admits
+  // or re-enrollments are allowed. The frontend filters COMPLETE
+  // courses out of the picker, but we still guard here so a stale
+  // form payload (cached before the toggle) can't slip through.
+  if (course.status === 'COMPLETE') {
     throw new AppError(
       httpStatus.BAD_REQUEST,
       'Selected course has been marked as completed and is no longer accepting enrollments. Re-open it from the Courses page first.',
@@ -267,18 +267,20 @@ const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: 
     }
 
     // Gate: a student may not enroll in another course while they have
-    // an active enrollment in a course whose batch is not yet marked
-    // complete. Without this, a student could be in HSC_1ST_YEAR and
-    // HSC_2ND_YEAR simultaneously, which is what the user explicitly
-    // wants to forbid ("can enroll another course after finished the
-    // current course"). We surface the blocking course name(s) in the
-    // error so the admin knows exactly which one to mark complete.
+    // an active enrollment in a course that hasn't been opened up for
+    // re-admission (i.e. its `isAllowAdmitAnotherCourse` flag is still
+    // false). The flag defaults to false and is flipped on by the
+    // admin when they transition the course to the COMPLETE stage
+    // (mirrors the old boolean `isCompleted=true` behavior — see
+    // course.service.ts `setCourseStatusToDB`). We surface the
+    // blocking course name(s) in the error so the admin knows which
+    // one to flip the flag on for.
     const blockingEnrollments = await tx.studentCourse.findMany({
       where: {
         studentId: existingStudent.id,
         isDeleted: false,
         courseId: { not: course.id },
-        course: { isCompleted: false },
+        course: { isAllowAdmitAnotherCourse: false },
       },
       select: { course: { select: { name: true } } },
     });
@@ -448,6 +450,7 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
   // course-specific ID match exactly. Re-using the studentId also lets
   // the admin hand the printed credentials card straight to the student
   // — one number, one password, no second lookup required.
+  console.log('student Id: ', studentId);
   const initialPassword = studentId;
   const hashedPassword = await bcrypt.hash(initialPassword, Number(config.bcryptSaltRounds) || 12);
 

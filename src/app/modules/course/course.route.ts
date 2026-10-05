@@ -69,11 +69,25 @@ router.patch(
 );
 
 router.patch(
-  '/:id/mark-completed',
+  '/:id/status',
   Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
   writeOperationRateLimiter,
-  validateRequest(CourseValidation.markCompletedSchema),
-  CourseController.markCompleted,
+  validateRequest(CourseValidation.setStatusSchema),
+  CourseController.setStatus,
+);
+
+// Independent manual override for the enrollment gate. Lives outside
+// the generic PATCH /:id so the lifecycle endpoint (which keeps the
+// flag in sync with `status`) is the standard path, and the override
+// is an explicit single-click action an admin takes when they want
+// to decouple the two for a one-off reason. See service comment for
+// the override-vs-status interaction rules.
+router.patch(
+  '/:id/admit-another-course',
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
+  writeOperationRateLimiter,
+  validateRequest(CourseValidation.toggleAdmitAnotherCourseSchema),
+  CourseController.toggleAdmitAnotherCourse,
 );
 
 export const CourseRoutes = router;

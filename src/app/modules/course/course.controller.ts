@@ -16,7 +16,7 @@ const createCourse = catchAsync(async (req, res) => {
 });
 
 const getAllCourses = catchAsync(async (req, res) => {
-  const filters = pick(req.query as Record<string, unknown>, ['isActive', 'searchTerm']);
+  const filters = pick(req.query as Record<string, unknown>, ['isActive', 'status', 'searchTerm']);
   const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
   // Express query strings are always strings — coerce isActive manually.
   if (filters.isActive !== undefined) {
@@ -89,19 +89,46 @@ const toggleActive = catchAsync(async (req, res) => {
   });
 });
 
-const markCompleted = catchAsync(async (req, res) => {
-  const result = await CourseService.markCourseCompletedToDB(
+const setStatus = catchAsync(async (req, res) => {
+  // Single-click status transition from the Courses page. The service
+  // keeps `isAllowAdmitAnotherCourse` in sync with the new status so
+  // an admin can't accidentally let a still-admitting course pretend
+  // to be graduated (or vice-versa).
+  const result = await CourseService.setCourseStatusToDB(
     req.params.id as string,
     req.body,
     req.user,
   );
-  const flag = result.isCompleted;
+  const stage = result.status;
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
-    message: flag
-      ? `Course "${result.name}" marked as completed. Students can now enroll in a new course.`
-      : `Course "${result.name}" re-opened. New enrollments are gated again.`,
+    message:
+      stage === 'COMPLETE'
+        ? `Course "${result.name}" marked as completed. Students can now enroll in another course.`
+        : stage === 'ONGOING'
+        ? `Course "${result.name}" is now ongoing. New admits are gated behind each student's existing enrollment.`
+        : `Course "${result.name}" is back in admission. New enrollments are open.`,
+    data: result,
+  });
+});
+
+const toggleAdmitAnotherCourse = catchAsync(async (req, res) => {
+  // Independent override for the enrollment gate. The Courses page
+  // surfaces this as a single-click toggle button next to the status
+  // segmented control so admins can flip the gate without touching
+  // the status enum. See `toggleCourseAdmitAnotherCourseToDB` for
+  // the override-vs-status interaction rules.
+  const result = await CourseService.toggleCourseAdmitAnotherCourseToDB(
+    req.params.id as string,
+    req.body.isAllowAdmitAnotherCourse,
+  );
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: result.isAllowAdmitAnotherCourse
+      ? `Course "${result.name}" now allows students to admit into another course.`
+      : `Course "${result.name}" now gates re-admissions behind each student's existing enrollment.`,
     data: result,
   });
 });
@@ -114,5 +141,6 @@ export const CourseController = {
   updateCourse,
   deleteCourse,
   toggleActive,
-  markCompleted,
+  setStatus,
+  toggleAdmitAnotherCourse,
 };

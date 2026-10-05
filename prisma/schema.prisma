@@ -104,6 +104,20 @@ enum FreeContentProvider {
   FILE
 }
 
+// Lifecycle stages a course moves through on the admin side. The status
+// drives UI affordances (course picker visibility, badge color on the
+// Courses page) and is independent from `isAllowAdmitAnotherCourse` —
+// the latter is the actual enrollment gate. A course can be in any
+// status with `isAllowAdmitAnotherCourse` set independently, but the
+// status-set endpoint keeps the two consistent (COMPLETE flips the
+// flag on; any other status flips it off) so admins can't accidentally
+// let a still-admitting course pretend to be graduated.
+enum CourseStatus {
+  ADMISSION
+  ONGOING
+  COMPLETE
+}
+
 model User {
   id                 String     @id @default(uuid())
   studentId          String     @unique
@@ -230,16 +244,24 @@ model Course {
   fee            Decimal    @db.Decimal(10, 2)
   hscBatch       HscBatch   @default(BATCH_27)
   isActive       Boolean    @default(true)
-  // Set by an admin when this batch has graduated / is no longer
-  // running classes. Used as the gate for student re-enrollment: a
-  // student cannot enroll in another course while they have an active
-  // enrollment in a course whose `isCompleted` is false. Independent
-  // of `StudentCourse.isCompleted` (which tracks per-enrollment
-  // course-grade completion and is set automatically by the exam
-  // module).
-  isCompleted    Boolean    @default(false)
+  // Course lifecycle stage. Drives UI affordances on the Courses page
+  // (badge color, picker visibility on the admit form). New courses
+  // start in `ADMISSION`. Admins move the course through `ONGOING` →
+  // `COMPLETE` from the Courses page (single-click segmented control,
+  // no edit modal required). Independent of `isAllowAdmitAnotherCourse`
+  // (see below) — status is descriptive, the flag is the gate.
+  status         CourseStatus @default(ADMISSION)
+  // Admin-controlled gate that overrides the natural
+  // "one-course-at-a-time" enrollment rule: when `true`, the
+  // enrollment block in `student.service.ts` lets a student with an
+  // active enrollment in this course admit another course. Defaults
+  // to `false`; the status-set endpoint flips it on when the admin
+  // moves a course to `COMPLETE`, and off for any other status, so
+  // the flag and the status can't drift.
+  isAllowAdmitAnotherCourse Boolean @default(false)
   // Nullable — tracks who and when the admin marked it complete so
-  // the activity-log can reconstruct the lifecycle.
+  // the activity-log can reconstruct the lifecycle. Stamped only on
+  // the COMPLETE transition; cleared on any other transition.
   completedAt    DateTime?
   completedBy    String?
   isDeleted      Boolean    @default(false)
@@ -257,7 +279,7 @@ model Course {
   completedByUser User? @relation("CourseCompletedBy", fields: [completedBy], references: [id], onDelete: SetNull)
 
   @@index([isActive])
-  @@index([isCompleted])
+  @@index([status])
   @@index([isDeleted])
   @@index([hscBatch])
   @@map("courses")

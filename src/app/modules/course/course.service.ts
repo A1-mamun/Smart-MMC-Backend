@@ -8,7 +8,8 @@ import {
   TUpdateCourse,
   TGetAllCourses,
   TBatchDayInput,
-  TMarkCompleted,
+  TSetStatus,
+  TToggleAdmitAnotherCourse,
 } from './course.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearCourseCache } from '../../utils/clearCache';
@@ -79,8 +80,10 @@ const getAllCoursesFromDB = async (filters: TGetAllCourses) => {
   if (filters.isActive !== undefined) {
     where.isActive = filters.isActive === 'true' || filters.isActive === true;
   }
-  if (filters.isCompleted !== undefined) {
-    where.isCompleted = filters.isCompleted === 'true' || filters.isCompleted === true;
+  // Course-level status filter (replaces the boolean `isCompleted`
+  // filter). Tri-state enum narrows the list to one lifecycle stage.
+  if (filters.status !== undefined) {
+    where.status = filters.status;
   }
   if (filters.searchTerm) {
     where.OR = [
@@ -232,19 +235,27 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
     data.isActive = payload.isActive;
   }
 
-  if (payload.isCompleted !== undefined) {
-    // Treat isCompleted as a side-effecting field: when the admin
-    // flips it on, stamp the timestamp so the activity log can
-    // answer "when was this batch marked complete". Flipping it off
-    // clears the timestamp. The actor (`completedBy`) is set via the
-    // dedicated PATCH /:id/mark-completed endpoint only — for the
-    // generic update path we don't have a user in scope.
-    data.isCompleted = payload.isCompleted;
-    if (payload.isCompleted === true) {
+  if (payload.status !== undefined) {
+    // Same side-effect semantics as the dedicated setStatus endpoint:
+    // COMPLETE stamps completedAt + flips isAllowAdmitAnotherCourse on;
+    // anything else clears completedAt and flips the gate off. We don't
+    // have a `user` in scope on the generic update path, so we don't
+    // stamp completedBy here — the dedicated endpoint does that.
+    data.status = payload.status;
+    if (payload.status === 'COMPLETE') {
       data.completedAt = new Date();
-    } else if (payload.isCompleted === false) {
+      data.isAllowAdmitAnotherCourse = true;
+    } else {
       data.completedAt = null;
+      data.isAllowAdmitAnotherCourse = false;
     }
+  }
+
+  if (payload.isAllowAdmitAnotherCourse !== undefined) {
+    // Admin explicitly overrode the gate without changing status. We
+    // accept whatever they set; the next setStatus transition will
+    // re-sync the two fields back to the standard mapping.
+    data.isAllowAdmitAnotherCourse = payload.isAllowAdmitAnotherCourse;
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -383,36 +394,75 @@ const toggleCourseActiveToDB = async (id: string, isActive: boolean) => {
 };
 
 /**
- * Mark a course batch as completed (or un-complete it). The admin
- * flow: flip the flag, we stamp the actor + timestamp, and the
- * enrollment gate in `student.service.ts` immediately starts letting
- * existing students re-enroll in another course.
+ * Independent override for the `isAllowAdmitAnotherCourse` enrollment
+ * gate. Decouples the gate from `status` so an admin can:
  *
- * Writing a separate endpoint (instead of just `PATCH /:id` with
- * `isCompleted`) gives us a single auditable hook for the lifecycle
- * event, mirrors `PATCH /:id/toggle-active`, and keeps the
- * general-purpose update endpoint free of timestamp side-effects.
+ *   - Open a still-`ADMISSION` course's gate mid-stream (e.g. a
+ *     straggler student being admitted to the next batch before
+ *     this batch has formally graduated).
+ *   - Close the gate on a manually-flagged course without moving
+ *     `status` back to `ADMISSION` (e.g. briefly opened for a one-
+ *     off re-admission; the admin wants to close it without losing
+ *     the COMPLETE audit trail).
+ *
+ * The override is short-term. The single-click setStatus transition
+ * re-applies the standard mapping (COMPLETE → flag on; anything else
+ * → flag off), so a later status change will reset this manual
+ * override. Document this in the UI tooltip so admins aren't
+ * surprised.
  */
-const markCourseCompletedToDB = async (
+const toggleCourseAdmitAnotherCourseToDB = async (
   id: string,
-  payload: TMarkCompleted['body'],
+  isAllowAdmitAnotherCourse: boolean,
+) => {
+  const existing = await prisma.course.findUnique({ where: { id } });
+  if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
+  const updated = await prisma.course.update({
+    where: { id },
+    data: { isAllowAdmitAnotherCourse },
+    include: courseInclude,
+  });
+  await clearCourseCache();
+  return updated;
+};
+
+/**
+ * Single-click course status transition. Drives the segmented control
+ * on the Courses page (ADMISSION / ONGOING / COMPLETE) and keeps
+ * `isAllowAdmitAnotherCourse` consistent with the new status so the
+ * descriptive badge and the actual enrollment gate can't drift:
+ *
+ *   - COMPLETE → flag ON (existing students may admit into another
+ *     course) + completedAt + completedBy stamped for audit.
+ *   - ADMISSION / ONGOING → flag OFF (existing one-course-at-a-time
+ *     gate back in force) + completedAt cleared.
+ *
+ * Mirrors `PATCH /:id/toggle-active` so the lifecycle event has a
+ * single auditable hook (and the actor `user` is in scope). Stamps
+ * `completedBy` only on the COMPLETE transition.
+ */
+const setCourseStatusToDB = async (
+  id: string,
+  payload: TSetStatus['body'],
   user: JwtPayload,
 ) => {
   const existing = await prisma.course.findUnique({ where: { id } });
   if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
 
-  const isCompleted = payload.isCompleted ?? true;
+  const status = payload.status;
+  const isCompleting = status === 'COMPLETE';
   const updated = await prisma.course.update({
     where: { id },
     data: {
-      isCompleted,
-      completedAt: isCompleted ? new Date() : null,
-      // Only stamp the actor when marking complete. Clearing on
-      // un-complete is intentional — the audit trail should reflect
-      // "this is NOT currently considered complete".
-      completedBy: isCompleted ? user.userId : null,
+      status,
+      isAllowAdmitAnotherCourse: isCompleting,
+      completedAt: isCompleting ? new Date() : null,
+      // Only stamp the actor on the COMPLETE transition. Clearing on
+      // a non-COMPLETE transition is intentional — the audit trail
+      // should reflect "this is NOT currently considered complete".
+      completedBy: isCompleting ? user.userId : null,
     },
-    include: { batchDays: { orderBy: { position: 'asc' } } },
+    include: courseInclude,
   });
   await clearCourseCache();
   return updated;
@@ -434,7 +484,8 @@ export const CourseService = {
   getCourseSeatsFromDB,
   updateCourseInDB,
   toggleCourseActiveToDB,
-  markCourseCompletedToDB,
+  toggleCourseAdmitAnotherCourseToDB,
+  setCourseStatusToDB,
   deleteCourseFromDB,
 };
 

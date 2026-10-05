@@ -7,6 +7,8 @@ const courseNames = [
   'ADMISSION',
 ] as const;
 
+const courseStatuses = ['ADMISSION', 'ONGOING', 'COMPLETE'] as const;
+
 const hscBatches = ['BATCH_25', 'BATCH_26', 'BATCH_27', 'BATCH_28'] as const;
 
 const batchTimeRegex = /^(0?[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$/i;
@@ -58,7 +60,18 @@ const updateCourseSchema = z.object({
     totalSeats: z.coerce.number().int().min(1).max(10000).nullable().optional(),
     batchDays: z.array(batchDaySchema).min(1).max(7).optional(),
     isActive: z.boolean().optional(),
-    isCompleted: z.boolean().optional(),
+    // Course-level status (ADMISSION / ONGOING / COMPLETE). Most admins
+    // will use the dedicated `setStatusSchema` endpoint (single-click
+    // transition that also keeps `isAllowAdmitAnotherCourse` in sync),
+    // but we keep this field editable from the generic update endpoint
+    // so the Course edit modal can still touch it if needed.
+    status: z.enum(courseStatuses).optional(),
+    // Independent gate flag. The single-click status-set endpoint keeps
+    // this consistent with `status` (COMPLETE → on, anything else → off);
+    // we expose it here so an admin can override without moving the
+    // course to COMPLETE (e.g. temporarily open re-admission while a
+    // course is still ADMISSION to clean up stragglers).
+    isAllowAdmitAnotherCourse: z.boolean().optional(),
   }),
   params: z.object({ id: z.string().uuid() }),
 });
@@ -66,7 +79,10 @@ const updateCourseSchema = z.object({
 const getAllCoursesSchema = z.object({
   query: z.object({
     isActive: z.union([z.boolean(), z.string()]).optional(),
-    isCompleted: z.union([z.boolean(), z.string()]).optional(),
+    // Course-level status filter. Tri-state on the wire: undefined
+    // returns everyone; one of ADMISSION/ONGOING/COMPLETE narrows to
+    // that stage.
+    status: z.enum(courseStatuses).optional(),
     searchTerm: z.string().optional(),
     page: z.coerce.number().int().min(1).optional(),
     limit: z.coerce.number().int().min(1).max(100).optional(),
@@ -84,14 +100,29 @@ const toggleActiveSchema = z.object({
   body: z.object({ isActive: z.boolean() }),
 });
 
-const markCompletedSchema = z.object({
+// Dedicated lifecycle endpoint — single-click status transition from
+// the Courses page. The service keeps `isAllowAdmitAnotherCourse`
+// in sync with the new status (COMPLETE → flag on; anything else →
+// flag off) so the two fields can't drift under the standard flow. An
+// admin who wants to decouple them can still do so via PATCH /:id
+// or the dedicated toggle endpoint below.
+const setStatusSchema = z.object({
   params: z.object({ id: z.string().uuid() }),
   body: z.object({
-    // Defaults to true; admins can also pass false to "un-complete"
-    // (e.g. toggled by accident). The service stamps completedAt /
-    // completedBy when true, clears them when false.
-    isCompleted: z.boolean().optional().default(true),
+    status: z.enum(courseStatuses),
   }),
+});
+
+// Independent manual override for the `isAllowAdmitAnotherCourse`
+// gate. Decouples the gate from the status enum so an admin can
+// (a) let a still-admitting course allow re-admission to clean up
+// stragglers, or (b) keep an `ONGOING` batch's gate closed even
+// mid-stream. The status-set endpoint resets the flag to its
+// default mapping on the next status transition, so this is a
+// short-term override, not a permanent decouple.
+const toggleAdmitAnotherCourseSchema = z.object({
+  params: z.object({ id: z.string().uuid() }),
+  body: z.object({ isAllowAdmitAnotherCourse: z.boolean() }),
 });
 
 export const CourseValidation = {
@@ -100,11 +131,13 @@ export const CourseValidation = {
   getAllCoursesSchema,
   idParamSchema,
   toggleActiveSchema,
-  markCompletedSchema,
+  setStatusSchema,
+  toggleAdmitAnotherCourseSchema,
 };
 
 export type TCreateCourse = z.infer<typeof createCourseSchema>['body'];
 export type TUpdateCourse = z.infer<typeof updateCourseSchema>;
 export type TGetAllCourses = z.infer<typeof getAllCoursesSchema>['query'];
-export type TMarkCompleted = z.infer<typeof markCompletedSchema>;
+export type TSetStatus = z.infer<typeof setStatusSchema>;
+export type TToggleAdmitAnotherCourse = z.infer<typeof toggleAdmitAnotherCourseSchema>;
 export type TBatchDayInput = z.infer<typeof batchDaySchema>;

@@ -17,19 +17,22 @@ const COURSE_NAME_TO_YEAR_DIGIT: Record<CourseName, string> = {
 
 const STARTING_ROLL = 200;
 
-const generateStudentId = async (
-  hscBatch: HscBatch,
-  courseName: CourseName,
-): Promise<string> => {
+const generateStudentId = async (hscBatch: HscBatch, courseName: CourseName): Promise<string> => {
   const batchNum = HSC_BATCH_TO_NUMBER[hscBatch];
   const yearDigit = COURSE_NAME_TO_YEAR_DIGIT[courseName];
   const prefix = `${batchNum}${yearDigit}`;
+  console.log('batchNum: ', batchNum);
+  console.log('yearDigit: ', yearDigit);
+
+  console.log('prefix: ', prefix);
 
   const latest = await prisma.user.findFirst({
     where: { studentId: { startsWith: prefix } },
     orderBy: { studentId: 'desc' },
     select: { studentId: true },
   });
+
+  console.log('latest student Id: ', latest?.studentId);
 
   let nextRoll = STARTING_ROLL;
   if (latest) {
