@@ -4,7 +4,12 @@ import { Prisma } from '@prisma/client';
 import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
-import { TCheckIn, TManualCheckIn, TGetStudentAttendance, TGetToday } from './attendance.validation';
+import {
+  TCheckIn,
+  TManualCheckIn,
+  TGetStudentAttendance,
+  TGetToday,
+} from './attendance.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearAttendanceCache } from '../../utils/clearCache';
 import {
@@ -12,13 +17,14 @@ import {
   TClassDayBatchDay,
   TClassDayStudentBatch,
   TSwapResolution,
+  parseTimeOfDay,
   weekdayNameFor,
 } from '../../utils/classDayCalendar';
 
 const studentDisplayInclude = {
   student: {
     include: {
-      user: { select: { id: true, studentId: true, name: true, nickname: true } },
+      user: { select: { id: true, mobile: true, name: true, nickname: true } },
       studentCourses: {
         where: { isDeleted: false },
         include: { course: true, payments: { where: { isDeleted: false } } },
@@ -115,8 +121,25 @@ const resolveAgainstCourses = async (params: {
 };
 
 const checkInStudentToDB = async (payload: TCheckIn) => {
-  const user = await prisma.user.findUnique({
-    where: { studentId: payload.studentId },
+  // The scanner can emit EITHER:
+  //   - a mobile number (legacy / manual entry path), or
+  //   - a `StudentCourse.studentCourseId` (the printed handle on the
+  //     student ID card, e.g. "272200" for HSC 27 year 2 roll 200).
+  // We resolve in two steps so both work:
+  //   1. Try `User.mobile` first (cheap, unique-indexed).
+  //   2. On miss, fall back to a `StudentCourse.studentCourseId`
+  //      lookup. The `studentCourseId` is `@unique` and indexed, so
+  //      this is a single round-trip.
+  // The old `User.studentId` (the global per-user string) was
+  // dropped along with the rest of the User refactor — the
+  // per-enrollment `studentCourseId` is the surviving printable
+  // handle, scoped per enrollment.
+  // console.log(`Check-in attempt: ${payload.studentId} (device ${payload.deviceId})`);
+  const input = payload.studentId.trim();
+
+  // Step 1: try by mobile.
+  let user = await prisma.user.findUnique({
+    where: { mobile: input },
     include: {
       student: {
         include: {
@@ -138,6 +161,40 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
     },
   });
 
+  // Step 2: fall back to the printed handle on the ID card.
+  if (!user) {
+    const enrollment = await prisma.studentCourse.findFirst({
+      where: { studentCourseId: input, isDeleted: false },
+      select: { studentId: true },
+    });
+    if (enrollment) {
+      user = await prisma.user.findUnique({
+        where: {
+          id: (
+            await prisma.student.findUnique({
+              where: { id: enrollment.studentId },
+              select: { userId: true },
+            })
+          )?.userId,
+        },
+        include: {
+          student: {
+            include: {
+              studentCourses: {
+                where: { isDeleted: false },
+                include: { course: true, payments: { where: { isDeleted: false } } },
+              },
+              batches: {
+                where: { isDeleted: false },
+                include: { batchDayRel: true },
+              },
+            },
+          },
+        },
+      });
+    }
+  }
+
   if (!user || user.isDeleted || !user.student) {
     throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
   }
@@ -158,10 +215,7 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
     courseIds: student.studentCourses.map((sc) => sc.courseId),
   });
   if (resolution.kind === 'no_class_today') {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      'No class scheduled in your course today',
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, 'No class scheduled in your course today');
   }
   if (resolution.kind === 'not_eligible') {
     throw new AppError(
@@ -175,6 +229,104 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
       'Your batch has no peer batch for make-up. Please attend your scheduled class day.',
     );
   }
+
+  /*
+   * Time-window guard for the automatic-attendance kiosk.
+   *
+   * Rule: check-ins are only allowed starting at the class start
+   * time and up to 5 minutes after. Scans outside this window
+   * (early arrivals, late stragglers) are rejected so the kiosk
+   * doesn't accept attendance for a class that hasn't started yet
+   * or that ended more than 5 minutes ago.
+   *
+   * The rule applies symmetrically to `normal` (the scan day IS
+   * the class day) and `swap` (the scan day is a peer batch and
+   * the row is recorded for the dedicated day). In both cases
+   * `startsAtMinutes` is the wall-clock start of the resolved
+   * class — the only thing that matters is "is `now_minutes`
+   * within `[start, start + 5]`?".
+   *
+   * Admin-driven manual check-ins bypass this gate (the manual
+   * endpoint doesn't call into this helper — see
+   * `manualCheckInToDB`). The kiosk is the only caller that
+   * benefits from the strict window, and gating it server-side
+   * means even a hand-typed scan in the kiosk UI can't bypass it.
+   */
+  /*
+   * Resolve the matched BatchDay + slot index ONCE so both the
+   * admit guard (slotStates[i] === false) and the window guard
+   * (manualWindowOverride[i] === true) below can read the
+   * same row. Hoisted to the top of this block because both
+   * guards need it.
+   */
+  const matchedSlot = await (async (): Promise<{
+    manualOpen: boolean;
+    slotOn: boolean;
+  }> => {
+    if (!resolution.winningCourseId) return { manualOpen: false, slotOn: false };
+    const winningBatch = student.batches.find(
+      (b) => b.batchDayRel?.courseId === resolution.winningCourseId,
+    );
+    if (!winningBatch?.batchDayId) return { manualOpen: false, slotOn: false };
+    const winningBatchDay = await prisma.batchDay.findUnique({
+      where: { id: winningBatch.batchDayId },
+      select: { slotStates: true, manualWindowOverride: true, times: true },
+    });
+    if (!winningBatchDay) return { manualOpen: false, slotOn: false };
+    const idx = winningBatchDay.times.indexOf(winningBatch.batchTime);
+    return {
+      manualOpen: idx >= 0 ? winningBatchDay.manualWindowOverride?.[idx] === true : false,
+      slotOn: idx >= 0 ? winningBatchDay.slotStates?.[idx] === true : false,
+    };
+  })();
+
+  /*
+   * Per-slot admit flag (slotStates[i] === false → kiosk locked
+   * out). Manual admin check-in via `/attendance/manual` bypasses
+   * this gate — see `manualCheckInToDB` — so the admin can still
+   * backfill a record after the fact. Runs BEFORE the time
+   * window so the kiosk also gets disabled if the admin turns
+   * attendance OFF mid-class.
+   */
+  if (matchedSlot.slotOn === false) {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      "Taking attendance is currently disabled for this slot. Ask the admin to turn on attendance for this batch's time slot.",
+    );
+  }
+
+  const CHECK_IN_WINDOW_MIN = 5;
+  const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+  const earliest = resolution.startsAtMinutes;
+  const latest = resolution.startsAtMinutes + CHECK_IN_WINDOW_MIN;
+  /*
+   * Check-in window override: if the admin flipped
+   * `manualWindowOverride[slotIdx] = true` (e.g. opened the
+   * window early for an early arrival, or kept it open past
+   * the 5-minute mark because the class was delayed), skip
+   * the 5-min guard entirely. The admin's override is the
+   * explicit "open the window" signal — they close it by
+   * flipping the switch back to false. The override is
+   * gated on the slot being ON (already enforced above), so
+   * a disabled slot stays locked out regardless of any
+   * stale override.
+   */
+  if (!matchedSlot.manualOpen) {
+    if (nowMin < earliest) {
+      throw new AppError(
+        httpStatus.BAD_REQUEST,
+        `The check-in window hasn't opened yet. It opens at ${minutesToClock(earliest)}.`,
+      );
+    }
+    if (nowMin > latest) {
+      throw new AppError(
+        httpStatus.BAD_REQUEST,
+        `The check-in window has closed. It closed at ${minutesToClock(latest)}.`,
+      );
+    }
+  }
+  // We don't need slotOverrideOpen / overrideOn because
+  // winningBatchDay is in scope. Use it directly.
 
   const recordedDate = resolution.date;
   const swapFromDate = resolution.kind === 'swap' ? resolution.swapFromDate : null;
@@ -235,7 +387,10 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
 
   return {
     student: {
-      studentId: user.studentId,
+      // Mobile replaces the dropped `User.studentId` as the per-account
+      // identifier. For per-enrollment display, callers can join on
+      // student.studentCourses[].studentCourseId instead.
+      mobile: user.mobile,
       name: user.name,
       nickname: user.nickname,
     },
@@ -255,10 +410,7 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
   };
 };
 
-const manualCheckInToDB = async (
-  payload: TManualCheckIn,
-  user: JwtPayload,
-) => {
+const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
   const student = await prisma.student.findUnique({
     where: { id: payload.studentId },
     include: {
@@ -285,9 +437,7 @@ const manualCheckInToDB = async (
   //      "today". Apply the same swap resolver so a manual entry
   //      from the admin panel honours the make-up rule too.
   const scanDate = getTodayDate();
-  let targetDate = payload.date
-    ? dayjs(payload.date).startOf('day').toDate()
-    : scanDate;
+  let targetDate = payload.date ? dayjs(payload.date).startOf('day').toDate() : scanDate;
   let swapFromDate: Date | null = null;
 
   if (!payload.date) {
@@ -297,10 +447,7 @@ const manualCheckInToDB = async (
       courseIds: student.studentCourses.map((sc) => sc.courseId),
     });
     if (resolution.kind === 'no_class_today') {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        'No class scheduled in their course today',
-      );
+      throw new AppError(httpStatus.BAD_REQUEST, 'No class scheduled in their course today');
     }
     if (resolution.kind === 'not_eligible') {
       throw new AppError(
@@ -361,7 +508,11 @@ const manualCheckInToDB = async (
 
   return {
     student: {
-      studentId: student.user.studentId,
+      // Mobile replaces the dropped `User.studentId` as the per-account
+      // identifier on the User object. The receipt / display layer
+      // joins on StudentCourse.studentCourseId when it needs the
+      // per-enrollment handle.
+      mobile: student.user.mobile,
       name: student.user.name,
       nickname: student.user.nickname,
     },
@@ -392,12 +543,19 @@ const getTodayAttendanceFromDB = async (filters: TGetToday) => {
   if (filters.hscBatch) {
     where.student = {
       isDeleted: false,
-      batches: { some: { hscBatch: filters.hscBatch as 'BATCH_25' | 'BATCH_26' | 'BATCH_27' | 'BATCH_28', isDeleted: false } },
+      batches: {
+        some: {
+          hscBatch: filters.hscBatch as 'BATCH_25' | 'BATCH_26' | 'BATCH_27' | 'BATCH_28',
+          isDeleted: false,
+        },
+      },
     };
   }
   if (filters.batchDay || filters.batchTime) {
     const batchWhere: Prisma.StudentBatchWhereInput = { isDeleted: false };
-    if (filters.batchDay) batchWhere.batchDay = filters.batchDay as 'SAT' | 'SUN' | 'MON' | 'TUE' | 'WED' | 'THU' | 'FRI';
+    if (filters.batchDay)
+      batchWhere.batchDay = filters.batchDay as
+        'SAT' | 'SUN' | 'MON' | 'TUE' | 'WED' | 'THU' | 'FRI';
     if (filters.batchTime) batchWhere.batchTime = filters.batchTime as 'TIME_7AM' | 'TIME_4PM';
     where.student = { ...(where.student as object), batches: { some: batchWhere } };
   }
@@ -484,6 +642,255 @@ const deleteAttendanceFromDB = async (id: string, user: JwtPayload) => {
   return null;
 };
 
+/**
+ * Render a minutes-since-midnight integer as "h:mm AM/PM" so we can
+ * echo the kiosk's check-in-window boundaries back to the operator
+ * ("opens at 4:00 PM", "closed at 4:05 PM"). Mirrors `parseTimeOfDay`
+ * (now centralised in `classDayCalendar.ts`) but in the opposite
+ * direction — kept local because it's only needed by the kiosk
+ * error messages above.
+ */
+const minutesToClock = (minutes: number): string => {
+  const hour24 = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  const meridiem = hour24 >= 12 ? 'PM' : 'AM';
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  return `${hour12}:${String(minute).padStart(2, '0')} ${meridiem}`;
+};
+
+/**
+ * Shape of `GET /attendance/current-batch` — the kiosk view polls
+ * this endpoint every minute and on every successful scan to
+ * decide what to display.
+ *
+ * `kind`:
+ *   - `current` — a batch is happening right now (now's time falls
+ *     inside a 60-min window starting at the batch's start time).
+ *   - `upcoming` — no batch is happening right now, but one is
+ *     scheduled later today. `minutesUntilStart` is the lead time.
+ *   - `none` — no batch is scheduled at all today (e.g. public
+ *     holiday, all courses paused). The kiosk shows a calm
+ *     "no class right now" message.
+ */
+export type TCurrentBatch =
+  | {
+      kind: 'current';
+      courseId: string;
+      courseName: string;
+      batchDayId: string;
+      batchDayName: string;
+      time: string;
+      startsAtMinutes: number;
+      endsAtMinutes: number;
+      // Per-batch class duration in total minutes. Drives the
+      // kiosk's live "X min remaining" / progress bar so the
+      // operator knows how much time is left in the current class
+      // (and so the auto-rotation poll flips to the next batch
+      // exactly when this one ends).
+      durationMinutes: number;
+      // Whether this slot is currently accepting attendance. Set to
+      // `true` for the resolved slot — the backend rejects scans
+      // server-side when the matched slot is `slotEnabled = false`,
+      // so this field is mostly informational on the frontend. The
+      // kiosk uses it to render the "Admit: Closed / Open" pill.
+      slotEnabled: boolean;
+      // Whether the admin's manual check-in window override is
+      // currently open. When true, the kiosk accepts scans for
+      // this slot regardless of the wall clock (the admin opened
+      // the window early or kept it open past the 5-min mark).
+      // The frontend can use this to show a "Window override
+      // active" hint so the operator knows the standard time
+      // window isn't in effect.
+      manualWindowOpen: boolean;
+    }
+  | {
+      kind: 'upcoming';
+      courseId: string;
+      courseName: string;
+      batchDayId: string;
+      batchDayName: string;
+      time: string;
+      minutesUntilStart: number;
+    }
+  | { kind: 'none' };
+
+/**
+ * Compute which batch (course + day + time) is happening RIGHT NOW
+ * for the kiosk / automatic-attendance view. We pull every active
+ * `BatchDay` whose `days[]` includes today's weekday, then for each
+ * `time` slot we compare the current wall-clock minute against the
+ * parsed slot. The "current" rule is a 60-min window starting at
+ * the slot start (matches a 1-hour class). If nothing is current we
+ * return the next upcoming slot (sorted by start time) so the kiosk
+ * can pre-announce. If nothing is scheduled today at all we return
+ * `{ kind: 'none' }`.
+ *
+ * Performance: a single round-trip pulls every BatchDay for active
+ * courses. For an institute with ~10 active courses and ~20 slots
+ * total this is < 1ms of server work, so caching is unnecessary.
+ */
+const getCurrentBatchFromDB = async (): Promise<TCurrentBatch> => {
+  const now = new Date();
+  const todayMinutes = now.getHours() * 60 + now.getMinutes();
+  const todayName = weekdayNameFor(now);
+
+  // Pull every BatchDay for active, non-deleted courses whose days[]
+  // include today. We over-fetch slightly (one query for current +
+  // upcoming) so a single endpoint can serve both states.
+  // `durationMinutes` is fetched too so the kiosk can render a
+  // real-time progress bar / "X mins remaining" countdown (and so
+  // the auto-rotation poll can flip to the next batch exactly when
+  // this one ends, regardless of whether the admin set a
+  // 60-min default or a custom 75-min class).
+  const allDays = await prisma.batchDay.findMany({
+    where: {
+      course: { isActive: true, isDeleted: false },
+    },
+    select: {
+      id: true,
+      name: true,
+      days: true,
+      times: true,
+      durationMinutes: true,
+      // Per-slot admit-enabled flag (parallel to `times[]`).
+      // The kiosk only accepts scans for slots whose flag is
+      // true. The override is a separate per-slot flag the
+      // admin toggles to open the check-in window early or
+      // keep it open past the 5-min mark — when it's true the
+      // kiosk admits scans for the slot regardless of the wall
+      // clock; when false (or absent) the default 5-min window
+      // applies. See `checkInStudentToDB` for the equivalent
+      // server-side backstop.
+      slotStates: true,
+      manualWindowOverride: true,
+      course: { select: { id: true, name: true } },
+    },
+  });
+
+  // Flatten into per-slot rows and parse times once. The slot
+  // resolution is in-memory so we don't have to round-trip the
+  // DB for each candidate. `durationMinutes` is per-BatchDay (not
+  // per-slot) — a single batch has one duration, applied to every
+  // `times[]` slot it owns. Defaults to 60 minutes when the admin
+  // hasn't set an explicit value (legacy compatibility).
+  type Slot = {
+    courseId: string;
+    courseName: string;
+    batchDayId: string;
+    batchDayName: string;
+    time: string;
+    minutes: number;
+    durationMinutes: number;
+    // Per-slot "barcode scan allowed right now" flag. The
+    // admin toggles this manually — the kiosk treats `true`
+    // as "admit scans" and `false` as "reject scans". The
+    // cross-course "only one ON" invariant is enforced at
+    // write time by `toggleBatchSlotToDB`, so at any given
+    // time AT MOST ONE slot in the database is true.
+    slotEnabled: boolean;
+    // Per-slot "check-in window override". When the i-th
+    // element is `true`, the kiosk accepts scans for that
+    // slot regardless of the wall clock (admin opened the
+    // window early for an early arrival, or kept it open
+    // past the 5-min mark). When `false` (or absent), the
+    // kiosk uses the default 5-minute window centred on
+    // the slot start time.
+    manualWindowOpen: boolean;
+  };
+  const slots: Slot[] = [];
+  for (const bd of allDays) {
+    if (!bd.days.some((d) => d.toLowerCase() === todayName.toLowerCase())) {
+      continue;
+    }
+    const duration = bd.durationMinutes ?? 60;
+    bd.times.forEach((t, i) => {
+      const minutes = parseTimeOfDay(t);
+      if (minutes === null) return;
+      // Read the raw booleans from BatchDay. Default to false
+      // so a missing / out-of-range index never accidentally
+      // lets scans through. The kiosk combines these with the
+      // wall-clock auto-cycle further down to decide whether
+      // the slot is "current" (admitting right now).
+      const slotEnabled = bd.slotStates?.[i] ?? false;
+      const manualWindowOpen = bd.manualWindowOverride?.[i] === true;
+      slots.push({
+        courseId: bd.course.id,
+        courseName: String(bd.course.name),
+        batchDayId: bd.id,
+        batchDayName: bd.name ?? '',
+        time: t,
+        minutes,
+        durationMinutes: duration,
+        slotEnabled,
+        manualWindowOpen,
+      });
+    });
+  }
+  if (slots.length === 0) return { kind: 'none' };
+
+  // The "current" window is [start, start + duration) — a 1h 15m
+  // class runs from 0 to 75, a 2h lab runs from 0 to 120. The
+  // kiosk auto-flips to the next batch the moment `now` crosses
+  // `endsAtMinutes`, so admins don't have to wait for the 60s poll
+  // when the next batch is starting in the same minute.
+  //
+  // We require `slotEnabled` here so the admin's manual toggle
+  // disables the slot from the kiosk's perspective. A slot that's
+  // current by the clock but disabled by the admin returns
+  // `{ kind: 'none' }` so the kiosk shows the calm "no class" message
+  // rather than promoting a disabled slot. The manual window
+  // override short-circuits the time check: when `manualWindowOpen`
+  // is true, the slot is "current" regardless of the wall clock.
+  // This lets the admin open the window early (e.g. admit an
+  // early arrival) or keep it open past the 5-min mark (e.g.
+  // when the class is delayed). The override is gated on the
+  // slot being ON (already enforced above), so a disabled slot
+  // stays locked out regardless of any stale override.
+  const currentSlot = slots.find(
+    (s) =>
+      s.slotEnabled &&
+      (s.manualWindowOpen ||
+        (todayMinutes >= s.minutes && todayMinutes < s.minutes + s.durationMinutes)),
+  );
+  if (currentSlot) {
+    return {
+      kind: 'current',
+      courseId: currentSlot.courseId,
+      courseName: currentSlot.courseName,
+      batchDayId: currentSlot.batchDayId,
+      batchDayName: currentSlot.batchDayName,
+      time: currentSlot.time,
+      startsAtMinutes: currentSlot.minutes,
+      endsAtMinutes: currentSlot.minutes + currentSlot.durationMinutes,
+      durationMinutes: currentSlot.durationMinutes,
+      slotEnabled: true,
+      manualWindowOpen: currentSlot.manualWindowOpen,
+    };
+  }
+
+  // No current slot — find the next upcoming one (any slot whose
+  // start is in the future). We pick the earliest so the kiosk
+  // can pre-announce the next class. The slotEnabled flag is
+  // NOT filtered here — the kiosk's pre-announce message can
+  // mention the soonest scheduled slot regardless of its
+  // current admit state, so the operator sees what's coming
+  // up next.
+  const upcomingSlots = slots
+    .filter((s) => s.minutes > todayMinutes)
+    .sort((a, b) => a.minutes - b.minutes);
+  if (upcomingSlots.length === 0) return { kind: 'none' };
+  const next = upcomingSlots[0];
+  return {
+    kind: 'upcoming',
+    courseId: next.courseId,
+    courseName: next.courseName,
+    batchDayId: next.batchDayId,
+    batchDayName: next.batchDayName,
+    time: next.time,
+    minutesUntilStart: next.minutes - todayMinutes,
+  };
+};
+
 export const AttendanceService = {
   checkInStudentToDB,
   manualCheckInToDB,
@@ -491,4 +898,5 @@ export const AttendanceService = {
   getStudentAttendanceFromDB,
   getAttendanceStatsFromDB,
   deleteAttendanceFromDB,
+  getCurrentBatchFromDB,
 };

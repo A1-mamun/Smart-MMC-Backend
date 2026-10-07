@@ -16,7 +16,15 @@ const REFRESH_COOKIE_OPTIONS = {
 
 const signUpFreeStudent = catchAsync(async (req: Request, res: Response) => {
   const result = await FreeClassService.signUpFreeStudentToDB(req.body);
-  res.cookie(authCookieName, result.refreshToken, REFRESH_COOKIE_OPTIONS);
+  // Intentionally do NOT set the refresh-token cookie here. The
+  // product flow is: signup → explicit signin. Setting the cookie
+  // on signup would make the proxy see an authenticated session
+  // before the user has actually signed in, leading to the
+  // "Your session has expired or is no longer valid" splash on
+  // `/free-classes` because the redux auth slice hasn't been
+  // populated yet. The refresh token is persisted server-side
+  // (RefreshToken table) so the upcoming signin can still find
+  // it; the cookie itself is only minted at signin time.
   sendResponse(res, {
     statusCode: httpStatus.CREATED,
     success: true,

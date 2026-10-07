@@ -2,6 +2,7 @@ export const studentFilterableFields = [
   'searchTerm',
   'hscBatch',
   'courseId',
+  'courseStatus',
   'batchDay',
   'batchDayId',
   'batchTime',
@@ -30,6 +31,12 @@ export const studentFilterableFields = [
   'absentOnDate',
 ];
 
-export const studentSearchableFields = ['user.name', 'user.nickname', 'user.studentId', 'mobile'];
+// `user.studentId` was removed when we migrated the canonical login
+// handle to mobile. The per-enrollment `studentCourse.studentCourseId`
+// is the printable handle on receipts, not a single global string on
+// User — so it doesn't make sense to search by it here. Admins search
+// by name / nickname / mobile, all of which are surfaced on the
+// students list.
+export const studentSearchableFields = ['user.name', 'user.nickname', 'mobile'];
 
 export { paginationFields } from '../../constant/pagination';

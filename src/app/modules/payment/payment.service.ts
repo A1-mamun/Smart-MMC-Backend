@@ -135,7 +135,10 @@ const getAllPaymentsFromDB = async (filters: TGetAllPayments) => {
     const searchFilter: Prisma.PaymentWhereInput['student'] = {
       OR: [
         { user: { name: { contains: filters.searchTerm, mode: 'insensitive' } } },
-        { user: { studentId: { contains: filters.searchTerm, mode: 'insensitive' } } },
+        // Mobile doubles as the login identifier now — searchable too
+        // so admins can find a student / payment by phone number.
+        // The dropped `User.studentId` is replaced here.
+        { user: { mobile: { contains: filters.searchTerm, mode: 'insensitive' } } },
         { mobile: { contains: filters.searchTerm, mode: 'insensitive' } },
       ],
     };
@@ -225,7 +228,10 @@ const getDuePaymentsFromDB = async (filters: TGetDuePayments = {}) => {
         // course still gets the right one preselected).
         studentCourseId: e.id,
         studentName: e.student.user.name,
-        studentUserId: e.student.user.studentId,
+        // Per-enrollment printable ID (`StudentCourse.studentCourseId`).
+        // Replaces the dropped `User.studentId` for receipt display —
+        // scope is per enrollment, not per user.
+        studentUserId: e.studentCourseId ?? e.student.userId,
         // Surface the student's mobile so the frontend search can match
         // it (consistent with /payment's search dimensions). Was not
         // previously exposed because the original Due tab had no search.

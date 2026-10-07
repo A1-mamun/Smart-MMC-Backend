@@ -28,6 +28,16 @@ router.post(
   AttendanceController.checkIn,
 );
 
+// Kiosk endpoint — powers the automatic-attendance full-screen
+// view. Same device-secret gate as `/check-in` (the kiosk device
+// uses a shared NEXT_PUBLIC_DEVICE_SECRET).
+router.get(
+  '/current-batch',
+  requireDeviceSecret,
+  validateRequest(AttendanceValidation.getTodaySchema),
+  AttendanceController.getCurrentBatch,
+);
+
 router.post(
   '/manual',
   Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),

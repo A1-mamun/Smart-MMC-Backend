@@ -67,6 +67,29 @@ const getStats = catchAsync(async (_req, res) => {
   });
 });
 
+/**
+ * GET /attendance/current-batch — powers the automatic-attendance
+ * kiosk view. Returns the batch (course + day + time) that's
+ * happening right now, or the next upcoming one if no batch is
+ * in progress, or `{ kind: 'none' }` if nothing is scheduled
+ * today. The kiosk polls this every minute (and after every
+ * successful scan) to auto-rotate the displayed batch.
+ *
+ * Unauthenticated on purpose — the kiosk view is opened in a
+ * separate window without the admin's JWT. The same `DEVICE_SECRET`
+ * gate used by `/attendance/check-in` applies here so only the
+ * shared-kiosk device can ask.
+ */
+const getCurrentBatch = catchAsync(async (req, res) => {
+  const result = await AttendanceService.getCurrentBatchFromDB();
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Current batch retrieved successfully',
+    data: result,
+  });
+});
+
 const deleteAttendance = catchAsync(async (req, res) => {
   await AttendanceService.deleteAttendanceFromDB(req.params.id as string, req.user as JwtPayload);
   sendResponse(res, {
@@ -83,5 +106,6 @@ export const AttendanceController = {
   getToday,
   getStudentAttendance,
   getStats,
+  getCurrentBatch,
   deleteAttendance,
 };

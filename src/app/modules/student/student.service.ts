@@ -69,7 +69,9 @@ const studentInclude = {
   user: {
     select: {
       id: true,
-      studentId: true,
+      // Mobile replaces the dropped `User.studentId` as the
+      // per-account identifier surfaced on the student detail.
+      mobile: true,
       name: true,
       nickname: true,
       status: true,
@@ -335,7 +337,7 @@ const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: 
         action: 'STUDENT_ENROLLED_IN_NEW_COURSE',
         entityType: 'StudentCourse',
         entityId: enrollment.id,
-        description: `Existing student "${existingStudent.user.name}" (${existingStudent.user.studentId}) enrolled in "${course.name}"`,
+        description: `Existing student "${existingStudent.user.name}" (${existingStudent.user.mobile}) enrolled in "${course.name}"`,
         metadata: {
           studentId: existingStudent.id,
           courseId: course.id,
@@ -368,7 +370,7 @@ const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: 
           action: 'FREE_STUDENT_CONVERTED',
           entityType: 'Student',
           entityId: existingStudent.id,
-          description: `Free student "${existingStudent.user.name}" (${existingStudent.user.studentId}) converted to paid course "${course.name}"`,
+          description: `Free student "${existingStudent.user.name}" (${existingStudent.user.mobile}) converted to paid course "${course.name}"`,
           metadata: {
             studentId: existingStudent.id,
             courseId: course.id,
@@ -392,7 +394,7 @@ const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: 
       // Reuse-case: no new credentials are generated. The student's
       // existing login (mobile) keeps working unchanged.
       initialPassword: null as string | null,
-      studentId: existingStudent.user.studentId,
+      studentId: newStudentCourseId,
       studentCourseId: newStudentCourseId,
       alreadyEnrolled: true as const,
     };
@@ -450,7 +452,7 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
   // course-specific ID match exactly. Re-using the studentId also lets
   // the admin hand the printed credentials card straight to the student
   // — one number, one password, no second lookup required.
-  console.log('student Id: ', studentId);
+  // console.log('student Id: ', studentId);
   const initialPassword = studentId;
   const hashedPassword = await bcrypt.hash(initialPassword, Number(config.bcryptSaltRounds) || 12);
 
@@ -467,7 +469,10 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
     );
     const newUser = await tx.user.create({
       data: {
-        studentId,
+        // User.studentId was dropped — mobile is the only handle
+        // on the User row. The `studentId` returned below is the
+        // per-enrollment `StudentCourse.studentCourseId` minted by
+        // `generateStudentId` for the receipt / student table.
         mobile: payload.mobile,
         name: payload.name,
         nickname: payload.nickname,
@@ -515,9 +520,10 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
         studentId: newStudent.id,
         courseId: course.id,
         enrolledBy: user.userId,
-        // First enrollment reuses the User.studentId (also generated
-        // from this course's hscBatch+name) so existing display
-        // expectations are preserved.
+        // First enrollment: the per-enrollment ID (`StudentCourse.studentCourseId`)
+        // IS the printable handle — it was previously duplicated onto
+        // `User.studentId` but that column was dropped. The receipt
+        // and student tables now both read from this column.
         studentCourseId: studentId,
       },
     });
@@ -583,6 +589,11 @@ const getAllStudentsFromDB = async (
     searchTerm,
     hscBatch,
     courseId,
+    // Course lifecycle filter — narrows the cohort to students
+    // whose active enrollment belongs to a course in the given
+    // stage. Stripped out of `filters` so the raw value doesn't
+    // leak into the Prisma WHERE clause.
+    courseStatus,
     batchDay,
     batchDayId,
     batchTime,
@@ -660,11 +671,13 @@ const getAllStudentsFromDB = async (
   if (searchTerm) {
     andConditions.push({
       OR: [
+        // Mobile doubles as the login handle — searchable so admins
+        // can find a student by phone number. The dropped
+        // `user.studentId` global handle is replaced by mobile.
         { mobile: { contains: searchTerm, mode: 'insensitive' } },
         { addressDistrict: { contains: searchTerm, mode: 'insensitive' } },
         { user: { is: { name: { contains: searchTerm, mode: 'insensitive' } } } },
         { user: { is: { nickname: { contains: searchTerm, mode: 'insensitive' } } } },
-        { user: { is: { studentId: { contains: searchTerm, mode: 'insensitive' } } } },
       ],
     });
   }
@@ -678,6 +691,20 @@ const getAllStudentsFromDB = async (
   if (courseId) {
     andConditions.push({
       studentCourses: { some: { courseId, isDeleted: false } },
+    });
+  }
+
+  // Course lifecycle filter — narrows the cohort to students whose
+  // active enrollment belongs to a course in the given stage
+  // (ADMISSION / ONGOING / COMPLETE). Combined with `courseId` when
+  // both are present (the specific-course match wins). Mirrors the
+  // Courses page tabs so the Students page can offer the same
+  // Admission / Ongoing / Complete cohort split.
+  if (filters.courseStatus) {
+    andConditions.push({
+      studentCourses: {
+        some: { isDeleted: false, course: { status: filters.courseStatus } },
+      },
     });
   }
 

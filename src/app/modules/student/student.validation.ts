@@ -144,6 +144,13 @@ const getAllStudentsSchema = z.object({
     searchTerm: z.string().optional(),
     hscBatch: z.enum(hscBatches).optional(),
     courseId: z.string().uuid().optional(),
+    // Course lifecycle filter — narrows the cohort to students whose
+    // active enrollment belongs to a course in the given stage. Useful
+    // for the Students page tabs (Admission / Ongoing / Complete)
+    // that mirror the Courses page tabs. When `courseId` is also
+    // set, the two filters are AND-combined (courseId wins on the
+    // match).
+    courseStatus: z.enum(['ADMISSION', 'ONGOING', 'COMPLETE']).optional(),
     batchDay: z.string().optional(),
     batchDayId: z.string().uuid().optional(),
     batchTime: z.string().optional(),

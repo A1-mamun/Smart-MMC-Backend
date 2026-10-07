@@ -7,7 +7,10 @@ export type TJwtPayload = {
   userId: string;
   name: string;
   role: TUserRole;
-  studentId: string;
+  // Mobile is the canonical login handle now — `User.studentId` was
+  // dropped. Keeping the JWT `studentId` claim would have been a
+  // vestigial reference to the old identifier; replaced by `mobile`.
+  mobile: string;
   // Free-class lifecycle flag — surfaced into the access token so the
   // frontend can route free users to /dashboard/free-classes without an
   // extra /auth/me roundtrip. Defaults to false on paid/admin tokens.

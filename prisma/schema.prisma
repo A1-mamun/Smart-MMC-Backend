@@ -119,114 +119,147 @@ enum CourseStatus {
 }
 
 model User {
-  id                 String     @id @default(uuid())
-  studentId          String     @unique
-  // Mobile is the new login identifier — one User/Student profile per
-  // phone number. Existing rows are backfilled from the matching
-  // Student.mobile during the migration. Admins (no Student profile)
-  // keep `mobile` null and continue to log in with their `studentId`
-  // (e.g. SMC-ADMIN-001). The @unique below treats NULL values as
-  // distinct in Postgres, so the many admin rows with NULL mobile
-  // continue to coexist.
-  mobile             String?   @unique
+  id                 String             @id @default(uuid())
+  // Mobile is the canonical login identifier for ALL user types
+  // (students, admins, super admins). The previous `studentId` string
+  // handle was dropped because (a) it was brittle across multi-course
+  // admits — a student admitted to HSC_1ST_YEAR then HSC_2ND_YEAR
+  // would either collide with the next roll number or get a stale
+  // global ID baked into User.studentId; and (b) admins had a parallel
+  // SMC-ADMIN-NNN identifier that added operational overhead. With
+  // mobile as the only handle the per-enrollment
+  // `StudentCourse.studentCourseId` (also shown on receipts) is the
+  // human-readable identifier, scoped per enrollment.
+  mobile             String
   name               String
   nickname           String?
   password           String
-  role               UserRole   @default(STUDENT)
-  status             UserStatus @default(ACTIVE)
+  role               UserRole           @default(STUDENT)
+  status             UserStatus         @default(ACTIVE)
   passwordChangedAt  DateTime?
-  passwordLevel      Int        @default(0)
-  mustChangePassword Boolean    @default(true)
+  passwordLevel      Int                @default(0)
+  mustChangePassword Boolean            @default(true)
   // Free-class lifecycle flags. A User is created via /free-class/signup
   // with isFreeAccount=true (and the mobile bcrypt'd as the password).
   // When an admin admits them to a paid course, the student.service flips
   // isFreeAccount=false and stamps freeConvertedAt — freeSignupAt stays
   // set so the marketing team can still see when they originally signed
   // up via the free funnel.
-  isFreeAccount      Boolean           @default(false)
+  isFreeAccount      Boolean            @default(false)
   freeSignupAt       DateTime?
   freeSignupSource   StudentIntakeMode?
   freeConvertedAt    DateTime?
-  isDeleted          Boolean    @default(false)
+  isDeleted          Boolean            @default(false)
   deletedAt          DateTime?
   deletedBy          String?
-  createdAt          DateTime   @default(now())
-  updatedAt          DateTime   @updatedAt
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
 
-  student           Student?           @relation("UserStudent")
-  refreshTokens     RefreshToken[]
-  passwordResets    PasswordResetRequest[]
-  admittedStudents  Student[]          @relation("AdmittedBy")
-  collectedPayments Payment[]          @relation("CollectedBy")
-  smsLogs           SmsLog[]           @relation("SmsSentBy")
-  examsCreated      Exam[]             @relation("ExamCreatedBy")
-  examsPublished    Exam[]             @relation("ExamPublishedBy")
-  examResultsUpdated ExamResult[]      @relation("ExamResultUpdatedBy")
-  settingsUpdated   Setting[]          @relation("SettingUpdatedBy")
-  coursesCompleted  Course[]           @relation("CourseCompletedBy")
+  student            Student?               @relation("UserStudent")
+  refreshTokens      RefreshToken[]
+  passwordResets     PasswordResetRequest[]
+  admittedStudents   Student[]              @relation("AdmittedBy")
+  collectedPayments  Payment[]              @relation("CollectedBy")
+  smsLogs            SmsLog[]               @relation("SmsSentBy")
+  examsCreated       Exam[]                 @relation("ExamCreatedBy")
+  examsPublished     Exam[]                 @relation("ExamPublishedBy")
+  examResultsUpdated ExamResult[]           @relation("ExamResultUpdatedBy")
+  settingsUpdated    Setting[]              @relation("SettingUpdatedBy")
+  coursesCompleted   Course[]               @relation("CourseCompletedBy")
 
-  @@index([studentId])
-  @@index([role])
+  // ─── Index strategy ─────────────────────────────────────────────────────
+  //
+  // `mobile` is the canonical lookup handle for every query path:
+  //   - sign-in / forgot-password / refresh-token: findUnique({ mobile })
+  //     → covered by the @unique index below (Postgres names it
+  //     `users_mobile_key`).
+  //   - free-class signup / check-in scanner (freeClass + attendance):
+  //     findFirst({ mobile, isDeleted: false }) → the leading mobile
+  //     column of the composite `@@index([mobile, isDeleted])` below
+  //     is the prefix that the membership index already serves.
+  //
+  // The composite `(mobile, isDeleted)` doubles as the soft-delete
+  // membership filter for the freeClass signup path. We DON'T add a
+  // redundant single-column `@@index([mobile])` because Prisma would
+  // reject the duplicate against the @unique index above. The leading
+  // column of the composite already serves single-column mobile
+  // lookups (Postgres B-tree prefix rule), so the unique index
+  // handles `findUnique({ mobile })` directly while the composite
+  // handles `findFirst({ mobile, isDeleted })`.
+  //
+  // For the admin user list (`getAllUsersFromDB`):
+  //   - filter by `role` → uses the leading role column of
+  //     `@@index([role, isDeleted])`.
+  //   - filter by `role + isDeleted` → composite covers both.
+  //   - the standalone `@@index([role])` and `@@index([isDeleted])`
+  //     from earlier versions were dropped because the composite
+  //     subsumes both (leading column rule).
+  //
+  // `status` (ACTIVE/BANNED) and `isFreeAccount` stay single-column
+  // because they're queried in isolation (the dashboard KPI counts
+  // free-class users across all roles).
+  @@unique([mobile])
+  @@index([mobile, isDeleted])
+  @@index([role, isDeleted])
   @@index([status])
-  @@index([isDeleted])
   @@index([isFreeAccount])
   @@map("users")
 }
 
 model Student {
-  id              String         @id @default(uuid())
-  userId          String         @unique
-  college         String?
+  id                String            @id @default(uuid())
+  userId            String            @unique
+  college           String?
   // One student profile per phone number — defensive duplicate
   // safeguard against bad imports or accidental double-admits. The
   // `enroll-existing` flow reuses an existing Student row by mobile
   // rather than creating a new one, so this never blocks legitimate
   // re-admissions.
-  mobile          String         @unique
-  bloodGroup      BloodGroup?
-  fatherName      String
-  fatherOccupation String
-  fatherMobile    String
-  motherName      String?
-  motherOccupation String?
-  motherMobile    String?
-  addressVillage  String?
+  mobile            String            @unique
+  bloodGroup        BloodGroup?
+  fatherName        String
+  fatherOccupation  String
+  fatherMobile      String
+  motherName        String?
+  motherOccupation  String?
+  motherMobile      String?
+  addressVillage    String?
   addressPostOffice String?
-  addressUpozila  String
-  addressDistrict String
-  sscInstitute    String
-  sscBoard        EducationBoard?
-  sscPassingYear  Int?
-  sscGpa          Decimal?       @db.Decimal(4, 2)
+  addressUpozila    String
+  addressDistrict   String
+  sscInstitute      String
+  sscBoard          EducationBoard?
+  sscPassingYear    Int?
+  sscGpa            Decimal?          @db.Decimal(4, 2)
   // Free-class signup captures a lightweight subset of fields and gets
   // placeholder strings ("FREE-pending" / "00000000000") for the NOT NULL
   // parent / SSC columns above. The admin fills in the real values via
   // EditStudentForm *before* admitting the student to a paid course.
-  intakeMode       StudentIntakeMode @default(ONLINE)
-  isFreeAccount    Boolean            @default(false)
-  freeSignupAt     DateTime?
-  freeConvertedAt  DateTime?
-  freeHscBatch     HscBatch?
-  freeDistrict     String?
-  freeUpazila      String?
-  admittedAt      DateTime       @default(now())
-  admittedBy      String
-  isDeleted       Boolean        @default(false)
-  deletedAt       DateTime?
-  deletedBy       String?
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
+  intakeMode        StudentIntakeMode @default(ONLINE)
+  isFreeAccount     Boolean           @default(false)
+  freeSignupAt      DateTime?
+  freeConvertedAt   DateTime?
+  freeHscBatch      HscBatch?
+  freeDistrict      String?
+  freeUpazila       String?
+  admittedAt        DateTime          @default(now())
+  admittedBy        String
+  isDeleted         Boolean           @default(false)
+  deletedAt         DateTime?
+  deletedBy         String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
 
-  user          User           @relation("UserStudent", fields: [userId], references: [id], onDelete: Cascade)
-  admittedByUser User          @relation("AdmittedBy", fields: [admittedBy], references: [id])
-  studentCourses StudentCourse[]
-  batches       StudentBatch[]
-  payments      Payment[]
-  attendance    Attendance[]
-  examResults   ExamResult[]
+  user                 User                  @relation("UserStudent", fields: [userId], references: [id], onDelete: Cascade)
+  admittedByUser       User                  @relation("AdmittedBy", fields: [admittedBy], references: [id])
+  studentCourses       StudentCourse[]
+  batches              StudentBatch[]
+  payments             Payment[]
+  attendance           Attendance[]
+  examResults          ExamResult[]
   weeklyAbsentWarnings WeeklyAbsentWarning[]
-  examAbsenceWarnings ExamAbsenceWarning[]
-  freeContentViews  FreeContentView[]
+  examAbsenceWarnings  ExamAbsenceWarning[]
+  freeContentViews     FreeContentView[]
 
   @@index([addressDistrict])
   @@index([sscPassingYear])
@@ -238,19 +271,19 @@ model Student {
 }
 
 model Course {
-  id             String     @id @default(uuid())
-  name           CourseName
-  description    String?
-  fee            Decimal    @db.Decimal(10, 2)
-  hscBatch       HscBatch   @default(BATCH_27)
-  isActive       Boolean    @default(true)
+  id                        String       @id @default(uuid())
+  name                      CourseName
+  description               String?
+  fee                       Decimal      @db.Decimal(10, 2)
+  hscBatch                  HscBatch     @default(BATCH_27)
+  isActive                  Boolean      @default(true)
   // Course lifecycle stage. Drives UI affordances on the Courses page
   // (badge color, picker visibility on the admit form). New courses
   // start in `ADMISSION`. Admins move the course through `ONGOING` →
   // `COMPLETE` from the Courses page (single-click segmented control,
   // no edit modal required). Independent of `isAllowAdmitAnotherCourse`
   // (see below) — status is descriptive, the flag is the gate.
-  status         CourseStatus @default(ADMISSION)
+  status                    CourseStatus @default(ADMISSION)
   // Admin-controlled gate that overrides the natural
   // "one-course-at-a-time" enrollment rule: when `true`, the
   // enrollment block in `student.service.ts` lets a student with an
@@ -258,25 +291,25 @@ model Course {
   // to `false`; the status-set endpoint flips it on when the admin
   // moves a course to `COMPLETE`, and off for any other status, so
   // the flag and the status can't drift.
-  isAllowAdmitAnotherCourse Boolean @default(false)
+  isAllowAdmitAnotherCourse Boolean      @default(false)
   // Nullable — tracks who and when the admin marked it complete so
   // the activity-log can reconstruct the lifecycle. Stamped only on
   // the COMPLETE transition; cleared on any other transition.
-  completedAt    DateTime?
-  completedBy    String?
-  isDeleted      Boolean    @default(false)
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  completedAt               DateTime?
+  completedBy               String?
+  isDeleted                 Boolean      @default(false)
+  createdAt                 DateTime     @default(now())
+  updatedAt                 DateTime     @updatedAt
 
   // Cap on concurrently-enrolled, non-deleted students. NULL = uncapped
   // (legacy). Admins edit from the Courses page. Enforced server-side
   // inside the admit/re-enroll transaction with a SELECT … FOR UPDATE
   // on the Course row, and mirrored on the frontend admit picker.
-  totalSeats     Int?
-  studentCourses StudentCourse[]
-  batchDays      BatchDay[]
-  exams          Exam[]
-  completedByUser User? @relation("CourseCompletedBy", fields: [completedBy], references: [id], onDelete: SetNull)
+  totalSeats      Int?
+  studentCourses  StudentCourse[]
+  batchDays       BatchDay[]
+  exams           Exam[]
+  completedByUser User?           @relation("CourseCompletedBy", fields: [completedBy], references: [id], onDelete: SetNull)
 
   @@index([isActive])
   @@index([status])
@@ -286,14 +319,66 @@ model Course {
 }
 
 model BatchDay {
-  id        String   @id @default(uuid())
-  courseId  String
-  name      String?
-  days      String[] @default([])
-  times     String[] @default([])
-  position  Int      @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                   String    @id @default(uuid())
+  courseId             String
+  name                 String?
+  days                 String[]  @default([])
+  times                String[]  @default([])
+  // Per-batch class duration in minutes (the kiosk shows the live
+  // countdown / progress bar based on this, and the schedule-
+  // conflict checker uses it to expand each slot into a real
+  // [start, end) interval).
+  //
+  // Required NOT NULL with a 60-minute default. The previous
+  // nullable column (kept for backward compat while the
+  // feature was being rolled out) is being tightened: any
+  // existing NULL rows are backfilled to 60 in the migration
+  // that flips this column. Going forward the frontend form
+  // always sends a positive integer (1..600), the create
+  // schema rejects missing values, and the conflict checker
+  // can trust the value to be present on every read.
+  durationMinutes      Int       @default(60)
+  // Per-slot "barcode scan allowed" flag, parallel to `times[]`.
+  // The admin turns a slot ON when the class is in session
+  // (kiosk accepts scans) and OFF when it ends (kiosk rejects
+  // scans). The toggle endpoint enforces the global invariant
+  // "only one slot ON across the entire database" so the kiosk
+  // can never serve two slots concurrently — when the admin
+  // turns one slot ON, every other slot in every BatchDay flips
+  // OFF atomically.
+  //
+  // Length matches `times[]`; the backend pads/trims to keep
+  // the arrays in sync. Stored as `Boolean[]` because the flag is
+  // strictly binary: ON (admit scans) or OFF (reject scans). The
+  // auto-cycle the previous design explored was abandoned — the
+  // admin manually flips the switch at class start and back at
+  // class end. This keeps the kiosk logic trivial (one boolean
+  // per slot) and makes the global invariant easy to reason
+  // about.
+  slotStates           Boolean[] @default([])
+  // Per-slot "check-in window override" flag, parallel to
+  // `times[]`. The default check-in window opens at class start
+  // and closes 5 minutes after — enough time for late
+  // arrivals to settle in but short enough that the admin
+  // can lock the slot once the lesson is underway. The admin
+  // can flip this override to `true` to open the window
+  // EARLY (e.g. admit a parent who's early) or to keep it
+  // open past the 5-minute mark (e.g. when the class is
+  // delayed). When the override is `false` (or absent), the
+  // kiosk uses the default 5-minute window centred on the
+  // slot start time.
+  //
+  // The override is per-slot so the admin can extend the
+  // window for one class without affecting the others.
+  // Length matches `times[]`; the backend pads/trims to keep
+  // the arrays in sync. Like `slotStates`, this is a plain
+  // `Boolean[]` — the absent case (no override, default
+  // 5-min window) is represented by `false` and re-interpreted
+  // on read.
+  manualWindowOverride Boolean[] @default([])
+  position             Int       @default(0)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   course         Course         @relation(fields: [courseId], references: [id], onDelete: Cascade)
   studentBatches StudentBatch[]
@@ -303,9 +388,9 @@ model BatchDay {
 }
 
 model StudentCourse {
-  id          String    @id @default(uuid())
-  studentId   String
-  courseId    String
+  id              String        @id @default(uuid())
+  studentId       String
+  courseId        String
   // Per-enrollment human-readable ID (e.g. "271200" — HSC batch 27,
   // year 1, roll 200). Lives on the enrollment, NOT on the User, so a
   // student enrolled in two courses gets two distinct IDs. The value is
@@ -313,20 +398,20 @@ model StudentCourse {
   // enrollment's course's hscBatch + name. Legacy rows are backfilled
   // during the migration. Unique because each course-specific roll
   // number must be distinct per enrollment.
-  studentCourseId String?  @unique
-  enrolledAt  DateTime  @default(now())
-  enrolledBy  String
-  isCompleted Boolean   @default(false)
-  completedAt DateTime?
-  status      PaymentStatus @default(PENDING)
-  isDeleted   Boolean   @default(false)
-  deletedAt   DateTime?
-  deletedBy   String?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  studentCourseId String?       @unique
+  enrolledAt      DateTime      @default(now())
+  enrolledBy      String
+  isCompleted     Boolean       @default(false)
+  completedAt     DateTime?
+  status          PaymentStatus @default(PENDING)
+  isDeleted       Boolean       @default(false)
+  deletedAt       DateTime?
+  deletedBy       String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
 
-  student  Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  course   Course   @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  student  Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course   Course    @relation(fields: [courseId], references: [id], onDelete: Restrict)
   payments Payment[]
 
   @@unique([studentId, courseId])
@@ -338,7 +423,7 @@ model StudentCourse {
 }
 
 model StudentBatch {
-  id         String  @id @default(uuid())
+  id         String    @id @default(uuid())
   studentId  String
   batchDayId String?
   batchDay   String
@@ -350,7 +435,7 @@ model StudentBatch {
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
 
-  student       Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  student     Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
   batchDayRel BatchDay? @relation(fields: [batchDayId], references: [id], onDelete: SetNull)
 
   @@index([hscBatch])
@@ -381,9 +466,9 @@ model Payment {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
-  student       Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  studentCourse StudentCourse? @relation(fields: [studentCourseId], references: [id], onDelete: SetNull)
-  collectedByUser User         @relation("CollectedBy", fields: [collectedBy], references: [id])
+  student         Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentCourse   StudentCourse? @relation(fields: [studentCourseId], references: [id], onDelete: SetNull)
+  collectedByUser User           @relation("CollectedBy", fields: [collectedBy], references: [id])
 
   @@index([studentId])
   @@index([paidAt])
@@ -394,13 +479,13 @@ model Payment {
 }
 
 model Attendance {
-  id          String           @id @default(uuid())
-  studentId   String
-  date        DateTime         @db.Date
-  checkInAt   DateTime         @default(now())
-  method      AttendanceMethod @default(NFC)
-  deviceId    String?
-  recordedBy  String?
+  id           String           @id @default(uuid())
+  studentId    String
+  date         DateTime         @db.Date
+  checkInAt    DateTime         @default(now())
+  method       AttendanceMethod @default(NFC)
+  deviceId     String?
+  recordedBy   String?
   // Set only when this row is a "make-up" — the recorded `date` is the
   // student's dedicated class day in their batch, but they physically
   // checked in on a peer batch's class day. e.g. a Batch A (Sat/Mon/Wed)
@@ -408,8 +493,8 @@ model Attendance {
   // this field = Sunday. Null for a regular scan. The unique constraint
   // on (studentId, date) is unchanged, so a student can still only have
   // one row per dedicated class day.
-  swapFromDate DateTime?       @db.Date
-  createdAt   DateTime         @default(now())
+  swapFromDate DateTime?        @db.Date
+  createdAt    DateTime         @default(now())
 
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
@@ -472,20 +557,20 @@ model PasswordResetRequest {
 }
 
 model SmsLog {
-  id           String        @id @default(uuid())
-  recipients   String        // CSV of normalised international numbers, e.g. "8801712345678,8801812345678"
+  id           String       @id @default(uuid())
+  recipients   String // CSV of normalised international numbers, e.g. "8801712345678,8801812345678"
   message      String
-  status       SmsLogStatus  @default(PENDING)
+  status       SmsLogStatus @default(PENDING)
   upstreamCode String?
   errorMsg     String?
-  count        Int           @default(0)
+  count        Int          @default(0)
   mode         SmsSendMode
   sentById     String
-  sentBy       User          @relation("SmsSentBy", fields: [sentById], references: [id], onDelete: Restrict)
-  createdAt    DateTime      @default(now())
+  sentBy       User         @relation("SmsSentBy", fields: [sentById], references: [id], onDelete: Restrict)
+  createdAt    DateTime     @default(now())
 
   weeklyAbsentWarnings WeeklyAbsentWarning[]
-  examAbsenceWarnings ExamAbsenceWarning[]
+  examAbsenceWarnings  ExamAbsenceWarning[]
 
   @@index([sentById])
   @@index([status])
@@ -494,24 +579,24 @@ model SmsLog {
 }
 
 model Exam {
-  id                String         @id @default(uuid())
-  title             String         @db.VarChar(200)
-  syllabus          String         @db.Text
-  examDate          DateTime       @db.Date
-  courseId          String
-  totalMarks        Int            // denormalised: sum of ExamSection.totalMarks
-  isResultPublished Boolean        @default(false)
-  publishedAt       DateTime?
-  publishedById     String?
-  createdById       String
-  createdBy         User           @relation("ExamCreatedBy",    fields: [createdById],   references: [id], onDelete: Restrict)
-  publishedBy       User?          @relation("ExamPublishedBy",  fields: [publishedById], references: [id], onDelete: SetNull)
-  course            Course         @relation(fields: [courseId], references: [id], onDelete: Restrict)
-  sections          ExamSection[]
-  results           ExamResult[]
+  id                  String               @id @default(uuid())
+  title               String               @db.VarChar(200)
+  syllabus            String               @db.Text
+  examDate            DateTime             @db.Date
+  courseId            String
+  totalMarks          Int // denormalised: sum of ExamSection.totalMarks
+  isResultPublished   Boolean              @default(false)
+  publishedAt         DateTime?
+  publishedById       String?
+  createdById         String
+  createdBy           User                 @relation("ExamCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  publishedBy         User?                @relation("ExamPublishedBy", fields: [publishedById], references: [id], onDelete: SetNull)
+  course              Course               @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  sections            ExamSection[]
+  results             ExamResult[]
   examAbsenceWarnings ExamAbsenceWarning[]
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
 
   @@index([courseId])
   @@index([examDate])
@@ -520,15 +605,15 @@ model Exam {
 }
 
 model ExamSection {
-  id               String         @id @default(uuid())
+  id               String              @id @default(uuid())
   examId           String
-  exam             Exam           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  exam             Exam                @relation(fields: [examId], references: [id], onDelete: Cascade)
   type             ExamSectionType
-  name             String         @db.VarChar(80)   // "MCQ" | "Srijonsil" | "BUET" | ...
+  name             String              @db.VarChar(80) // "MCQ" | "Srijonsil" | "BUET" | ...
   totalQuestions   Int
-  marksPerQuestion Decimal        @db.Decimal(6, 2)
-  totalMarks       Int            // totalQuestions * marksPerQuestion (computed at write)
-  position         Int            @default(0)
+  marksPerQuestion Decimal             @db.Decimal(6, 2)
+  totalMarks       Int // totalQuestions * marksPerQuestion (computed at write)
+  position         Int                 @default(0)
   resultSections   ExamResultSection[]
 
   @@unique([examId, name])
@@ -537,17 +622,17 @@ model ExamSection {
 }
 
 model ExamResult {
-  id             String         @id @default(uuid())
-  examId         String
-  exam           Exam           @relation(fields: [examId], references: [id], onDelete: Cascade)
-  studentId      String
-  student        Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  id            String              @id @default(uuid())
+  examId        String
+  exam          Exam                @relation(fields: [examId], references: [id], onDelete: Cascade)
+  studentId     String
+  student       Student             @relation(fields: [studentId], references: [id], onDelete: Cascade)
   // Default ABSENT. Attendance is recorded on the day of the exam via the
   // barcode scanner or manual toggle on the Examinees tab. We do NOT
   // pre-mark anyone present at exam creation — even if a student is on the
   // roster, they haven't physically shown up yet.
-  isAbsent       Boolean        @default(true)
-  obtainedMarks  Int            @default(0)        // denormalised: sum of ExamResultSection.obtainedMarks
+  isAbsent      Boolean             @default(true)
+  obtainedMarks Int                 @default(0) // denormalised: sum of ExamResultSection.obtainedMarks
   // Tracks whether the admin has actually opened the Results tab and
   // explicitly saved marks for this student. We use it as the gating
   // signal for `Publish results` — `obtainedMarks > 0` alone isn't enough
@@ -557,14 +642,14 @@ model ExamResult {
   // non-default signal (any non-zero section mark, correctAnswers, notes,
   // or a non-empty remarks). Reset to false when the student is marked
   // ABSENT in `setAttendanceToDB`.
-  marksEntered   Boolean        @default(false)
-  rank           Int?                              // computed on publish (null until then)
-  remarks        String?        @db.VarChar(500)
-  updatedById    String?
-  updatedBy      User?          @relation("ExamResultUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
-  sections       ExamResultSection[]
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  marksEntered  Boolean             @default(false)
+  rank          Int? // computed on publish (null until then)
+  remarks       String?             @db.VarChar(500)
+  updatedById   String?
+  updatedBy     User?               @relation("ExamResultUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  sections      ExamResultSection[]
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
 
   @@unique([examId, studentId])
   @@index([examId])
@@ -574,14 +659,14 @@ model ExamResult {
 }
 
 model ExamResultSection {
-  id             String         @id @default(uuid())
+  id             String      @id @default(uuid())
   resultId       String
-  result         ExamResult     @relation(fields: [resultId], references: [id], onDelete: Cascade)
+  result         ExamResult  @relation(fields: [resultId], references: [id], onDelete: Cascade)
   sectionId      String
-  section        ExamSection    @relation(fields: [sectionId], references: [id], onDelete: Restrict)
-  correctAnswers Int?                                // for MCQ: # of right answers; multiplies by section.marksPerQuestion
-  obtainedMarks  Int            @default(0)
-  notes          String?        @db.VarChar(300)
+  section        ExamSection @relation(fields: [sectionId], references: [id], onDelete: Restrict)
+  correctAnswers Int? // for MCQ: # of right answers; multiplies by section.marksPerQuestion
+  obtainedMarks  Int         @default(0)
+  notes          String?     @db.VarChar(300)
 
   @@unique([resultId, sectionId])
   @@index([resultId])
@@ -641,18 +726,18 @@ model WeeklyAbsentWarning {
 // academic years. The `absentDate` echoes Exam.examDate for audit; the
 // `warnedAt` captures the calendar day the SMS actually fired.
 model ExamAbsenceWarning {
-  id            String   @id @default(uuid())
-  examId        String
-  studentId     String
-  absentDate    DateTime @db.Date
-  warnedAt      DateTime @db.Date
-  sentToMobile  String
-  smsLogId      String?
-  createdAt     DateTime @default(now())
+  id           String   @id @default(uuid())
+  examId       String
+  studentId    String
+  absentDate   DateTime @db.Date
+  warnedAt     DateTime @db.Date
+  sentToMobile String
+  smsLogId     String?
+  createdAt    DateTime @default(now())
 
-  exam    Exam     @relation(fields: [examId],    references: [id], onDelete: Cascade)
-  student Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  smsLog  SmsLog?  @relation(fields: [smsLogId],  references: [id], onDelete: SetNull)
+  exam    Exam    @relation(fields: [examId], references: [id], onDelete: Cascade)
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  smsLog  SmsLog? @relation(fields: [smsLogId], references: [id], onDelete: SetNull)
 
   @@unique([examId, studentId])
   @@index([examId])
@@ -684,18 +769,18 @@ model FreeSubject {
 }
 
 model FreeChapter {
-  id          String   @id @default(uuid())
-  subjectId   String
-  title       String   @db.VarChar(200)
-  position    Int      @default(0)
+  id            String   @id @default(uuid())
+  subjectId     String
+  title         String   @db.VarChar(200)
+  position      Int      @default(0)
   // 1-based, admin-supplied. Drives the sort order (chapterNumber=1
   // shows first) AND is enforced unique per subject via the unique
   // index below. Admin can leave gaps (e.g. 1, 3 — chapter 2 is
   // intentionally skipped) so they can reserve future slots.
-  chapterNumber Int?    @db.SmallInt
-  isPublished Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  chapterNumber Int?     @db.SmallInt
+  isPublished   Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   subject FreeSubject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
   topics  FreeTopic[]
@@ -707,25 +792,25 @@ model FreeChapter {
 }
 
 model FreeTopic {
-  id          String  @id @default(uuid())
-  chapterId   String
-  title       String  @db.VarChar(200)
-  position    Int     @default(0)
+  id        String @id @default(uuid())
+  chapterId String
+  title     String @db.VarChar(200)
+  position  Int    @default(0)
 
   // Provider + raw id. The /free-class/content endpoint SELECTs these out
   // so they never reach the wire — only /free-class/content/:id/play can
   // mint an embed URL using them.
   provider         FreeContentProvider
-  providerVideoId  String @db.VarChar(200)
-  providerEmbedUrl String? @db.Text   // optional cached embed URL
-  vdoCipherOtp     String? @db.Text   // paid-flow OTP cache (unused in v1)
+  providerVideoId  String              @db.VarChar(200)
+  providerEmbedUrl String?             @db.Text // optional cached embed URL
+  vdoCipherOtp     String?             @db.Text // paid-flow OTP cache (unused in v1)
   durationSeconds  Int?
-  thumbnailUrl     String? @db.Text
-  isPublished      Boolean @default(false)
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  thumbnailUrl     String?             @db.Text
+  isPublished      Boolean             @default(false)
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
 
-  chapter FreeChapter @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  chapter FreeChapter       @relation(fields: [chapterId], references: [id], onDelete: Cascade)
   views   FreeContentView[]
 
   @@index([chapterId, position])
@@ -742,7 +827,7 @@ model FreeContentView {
   lastViewedAt   DateTime @default(now())
   watchedSeconds Int      @default(0)
 
-  topic   FreeTopic @relation(fields: [topicId],   references: [id], onDelete: Cascade)
+  topic   FreeTopic @relation(fields: [topicId], references: [id], onDelete: Cascade)
   student Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
   @@unique([topicId, studentId])

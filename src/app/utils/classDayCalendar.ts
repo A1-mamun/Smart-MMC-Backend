@@ -1,6 +1,30 @@
 import dayjs from 'dayjs';
 
 /**
+ * Parse an "h:mm AM/PM" string (the format `BatchDay.times[]` and
+ * `StudentBatch.batchTime` are stored in) into a total
+ * minutes-since-midnight number. Returns `null` on malformed input
+ * so the caller can skip rather than crash on a typo'd schedule.
+ *
+ * Centralised here (rather than duplicated in `attendance.service.ts`
+ * as `parseTimeOfDay`) because both the current-batch feature and
+ * the 5-min scan-window guard depend on the same parse — keeping
+ * one definition ensures they always agree on edge cases like
+ * midnight-spanning times.
+ */
+export const parseTimeOfDay = (raw: string): number | null => {
+  const m = raw.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!m) return null;
+  let hour = Number(m[1]);
+  const minute = Number(m[2]);
+  const meridiem = m[3].toUpperCase();
+  if (meridiem === 'PM' && hour !== 12) hour += 12;
+  if (meridiem === 'AM' && hour === 12) hour = 0;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return hour * 60 + minute;
+};
+
+/**
  * Calendar-class-day helpers. Used by `attendance.service.ts` to resolve
  * a barcode/NFC scan on a peer-batch day into an attendance row stamped
  * for the student's dedicated class day.
@@ -133,6 +157,13 @@ export type TClassDayStudentBatch = {
   // the call-site type stays compatible with the existing Prisma
   // include shape.
   batchDay?: string;
+  // Wall-clock start time of this student's enrollment slot (e.g.
+  // "4:00 PM"). Single string per `StudentBatch` row — a student
+  // has exactly one batch slot per course. Used by the resolver
+  // to populate `startsAtMinutes` so callers can enforce
+  // time-windowed rules (e.g. the kiosk's "scan only allowed for
+  // the first 5 minutes of the class" gate).
+  batchTime?: string;
   batchDayRel: TClassDayBatchDay | null;
 };
 
@@ -172,13 +203,44 @@ export const buildDedicatedClassDays = (
  *                      explicitly disallowed.
  *   no_peer_batch    — student has only one active BatchDay row in
  *                      this course; no swap is possible.
+ *
+ * The `startsAtMinutes` field (when set) carries the wall-clock start
+ * minute-of-day of the resolved class. Callers use it to enforce
+ * time-windowed rules like the kiosk's "scan only allowed for the
+ * first 5 minutes of the class" gate. It's only meaningful on the
+ * `normal` / `swap` variants — the rejection variants don't pick a
+ * batch to validate against.
  */
 export type TSwapResolution =
-  | { kind: 'normal'; date: Date }
-  | { kind: 'swap'; date: Date; swapFromDate: Date }
+  | { kind: 'normal'; date: Date; startsAtMinutes: number }
+  | { kind: 'swap'; date: Date; swapFromDate: Date; startsAtMinutes: number }
   | { kind: 'no_class_today' }
   | { kind: 'not_eligible' }
   | { kind: 'no_peer_batch' };
+
+/**
+ * Build the `startsAtMinutes` from the student's own batch rows for
+ * the resolved weekday. Returns `null` if the student isn't enrolled
+ * in a slot that runs on that weekday OR if their `batchTime` is
+ * malformed (so the 5-min check-in window guard can treat the scan
+ * as ambiguous and skip the guard rather than reject on bad data).
+ *
+ * Picked by the resolver, not by the consumer, so the contract for
+ * the `startsAtMinutes` field is consistent across all callers.
+ */
+const pickStudentSlotStart = (
+  studentBatches: TClassDayStudentBatch[],
+  weekday: TWeekdayName,
+): number | null => {
+  for (const sb of studentBatches) {
+    const bd = sb.batchDayRel;
+    if (!bd || !sb.batchTime) continue;
+    if (!bd.days.some((d) => d.toLowerCase() === weekday.toLowerCase())) continue;
+    const parsed = parseTimeOfDay(sb.batchTime);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+};
 
 /**
  * Try to resolve a scan date to the date the attendance row should be
@@ -235,7 +297,24 @@ export const resolveAttendanceDate = (params: {
 
   // Scan day is on the dedicated set — normal check-in.
   if (dedicated.includes(scanWeekday)) {
-    return { kind: 'normal', date: dayjs(scanDate).startOf('day').toDate() };
+    // `active` (filtered) is the student's own batch rows for this
+    // course. Pick the first row whose `batchDayRel.days[]` contains
+    // the scan weekday — that's the slot the student is enrolled in.
+    // A student in multiple batches within the same course is rare;
+    // we take the first match. `batchTime` is the single string
+    // start-of-class for that slot.
+    //
+    // When the student has no parseable slot (e.g. legacy row with
+    // a malformed `batchTime`), default to 0 (midnight) so the
+    // check-in window guard naturally rejects the scan — the
+    // alternative would be to throw, which would crash the
+    // check-in flow on a single bad row.
+    const slotStart = pickStudentSlotStart(active, scanWeekday) ?? 0;
+    return {
+      kind: 'normal',
+      date: dayjs(scanDate).startOf('day').toDate(),
+      startsAtMinutes: slotStart,
+    };
   }
 
   // Walk ±1 in the cyclic union and check whether either neighbour is
@@ -253,20 +332,26 @@ export const resolveAttendanceDate = (params: {
     // "Missed my dedicated day, came the next union day" — the day
     // before the scan day is the student's dedicated day. Walk back
     // 1 calendar day. dayjs handles month/year boundaries cleanly.
+    // The dedicated day for the swap is `prev`, so use that to pick
+    // the slot start.
+    const slotStart = pickStudentSlotStart(active, prev) ?? 0;
     return {
       kind: 'swap',
       date: dayjs(scanDate).subtract(1, 'day').startOf('day').toDate(),
       swapFromDate: dayjs(scanDate).startOf('day').toDate(),
+      startsAtMinutes: slotStart,
     };
   }
   if (!prevDedicated && nextDedicated) {
     // "Emergency on my dedicated day, came the previous union day" —
     // the day after the scan day is the student's dedicated day. Walk
     // forward 1 calendar day. dayjs handles week/month boundaries.
+    const slotStart = pickStudentSlotStart(active, next) ?? 0;
     return {
       kind: 'swap',
       date: dayjs(scanDate).add(1, 'day').startOf('day').toDate(),
       swapFromDate: dayjs(scanDate).startOf('day').toDate(),
+      startsAtMinutes: slotStart,
     };
   }
   if (prevDedicated && nextDedicated) {
@@ -274,10 +359,12 @@ export const resolveAttendanceDate = (params: {
     // let the UI / activity log flag the ambiguity. We don't have this
     // case in the seeded data; it's here so the helper is robust if
     // someone defines a batch layout that triggers it.
+    const slotStart = pickStudentSlotStart(active, prev) ?? 0;
     return {
       kind: 'swap',
       date: dayjs(scanDate).subtract(1, 'day').startOf('day').toDate(),
       swapFromDate: dayjs(scanDate).startOf('day').toDate(),
+      startsAtMinutes: slotStart,
     };
   }
 

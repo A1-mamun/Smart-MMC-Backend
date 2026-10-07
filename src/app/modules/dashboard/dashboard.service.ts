@@ -192,7 +192,11 @@ const getStudentDashboardDataFromDB = async (userId: string) => {
 
   return {
     profile: {
-      studentId: student.user.studentId,
+      // Per-enrollment printable ID (the receipt header shows this
+      // instead of the dropped `User.studentId`). Falls back to
+      // the UUID when no enrollment is on file (admin/student with
+      // no StudentCourse row).
+      studentId: student.studentCourses?.[0]?.studentCourseId ?? student.userId,
       name: student.user.name,
       nickname: student.user.nickname,
       mobile: student.mobile,

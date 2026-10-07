@@ -32,7 +32,7 @@ const hashFreePassword = (plain: string) =>
 const signTokens = (
   user: {
     id: string;
-    studentId: string;
+    mobile: string;
     name: string;
     role: 'STUDENT';
     isFreeAccount: boolean;
@@ -42,7 +42,7 @@ const signTokens = (
     userId: user.id,
     name: user.name,
     role: user.role as TUserRole,
-    studentId: user.studentId,
+    mobile: user.mobile,
     isFreeAccount: user.isFreeAccount,
   };
   const accessToken = generateAccessToken(tokenPayload);
@@ -59,7 +59,7 @@ const signTokens = (
 const signTokensAndPersist = async (
   user: {
     id: string;
-    studentId: string;
+    mobile: string;
     name: string;
     role: 'STUDENT';
     isFreeAccount: boolean;
@@ -82,7 +82,7 @@ const signTokensAndPersistInTx = async (
   tx: Pick<typeof prisma, 'refreshToken'>,
   user: {
     id: string;
-    studentId: string;
+    mobile: string;
     name: string;
     role: 'STUDENT';
     isFreeAccount: boolean;
@@ -130,7 +130,10 @@ const signUpFreeStudentToDB = async (payload: TFreeSignup) => {
       return await prisma.$transaction(async (tx) => {
         const user = await tx.user.create({
           data: {
-            studentId: attempt === 0 ? studentId : mintFreeStudentId(),
+            // User.studentId was dropped — mobile is the only handle
+            // here. The free-class content view (`FreeContentView`) is
+            // keyed off Student.id, not User.studentId, so this doesn't
+            // break content tracking.
             mobile: payload.mobile,
             name: payload.name,
             password: hashed,
@@ -172,7 +175,7 @@ const signUpFreeStudentToDB = async (payload: TFreeSignup) => {
 
         const tokens = await signTokensAndPersistInTx(tx, {
           id: user.id,
-          studentId: user.studentId,
+          mobile: user.mobile,
           name: user.name,
           role: 'STUDENT',
           isFreeAccount: true,
@@ -181,7 +184,6 @@ const signUpFreeStudentToDB = async (payload: TFreeSignup) => {
         return {
           user: {
             id: user.id,
-            studentId: user.studentId,
             mobile: user.mobile,
             name: user.name,
             role: user.role,
@@ -242,7 +244,7 @@ const freeLoginToDB = async (payload: TFreeLogin) => {
 
   const tokens = await signTokensAndPersist({
     id: user.id,
-    studentId: user.studentId,
+    mobile: user.mobile,
     name: user.name,
     role: 'STUDENT',
     isFreeAccount: true,
@@ -251,7 +253,6 @@ const freeLoginToDB = async (payload: TFreeLogin) => {
   return {
     user: {
       id: user.id,
-      studentId: user.studentId,
       mobile: user.mobile,
       name: user.name,
       role: user.role,

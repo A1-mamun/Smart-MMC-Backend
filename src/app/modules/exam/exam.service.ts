@@ -820,22 +820,24 @@ const bulkAttendanceByStudentIdToDB = async (
   payload: TBulkAttendanceByStudentId,
   user: JwtPayload,
 ) => {
-  // The barcode scanner feeds raw studentId *strings* (e.g. "BD00042"). We
-  // resolve each one to a Student and check whether they're on the roster.
+  // The barcode scanner feeds raw studentId *strings* (e.g. "BD00042",
+  // which is `StudentCourse.studentCourseId` — the per-enrollment
+  // printable handle). The dropped `User.studentId` is no longer the
+  // scanner input. We resolve each scan to a Student via the
+  // StudentCourse join.
   const trimmed = payload.studentIds.map((s) => s.trim()).filter(Boolean);
   const unique = Array.from(new Set(trimmed));
 
-  const users = await prisma.user.findMany({
-    where: { studentId: { in: unique }, isDeleted: false },
-    select: { id: true, studentId: true },
+  const studentCourses = await prisma.studentCourse.findMany({
+    where: { studentCourseId: { in: unique }, isDeleted: false },
+    select: { studentCourseId: true, studentId: true },
   });
-  const userIdByCode = new Map(users.map((u) => [u.studentId, u.id]));
+  const studentIdByCode = new Map(
+    studentCourses.map((sc) => [sc.studentCourseId, sc.studentId]),
+  );
 
-  const students = await prisma.student.findMany({
-    where: { userId: { in: users.map((u) => u.id) }, isDeleted: false },
-    select: { id: true, userId: true },
-  });
-  const studentIdByUserId = new Map(students.map((s) => [s.userId, s.id]));
+  // We don't need a user→student indirection anymore — the
+  // StudentCourse scan above already gave us the Student.id directly.
 
   const roster = await prisma.examResult.findMany({
     where: { examId },
@@ -848,8 +850,7 @@ const bulkAttendanceByStudentIdToDB = async (
   const unknown: string[] = [];
 
   for (const code of unique) {
-    const userId = userIdByCode.get(code);
-    const studentId = userId ? studentIdByUserId.get(userId) : undefined;
+    const studentId = studentIdByCode.get(code);
     if (!studentId) {
       unknown.push(code);
       continue;
@@ -1071,7 +1072,11 @@ const getExamByIdToDB = async (id: string) => {
             // included so we never show ghost rows.
             include: {
               user: {
-                select: { studentId: true, name: true, nickname: true },
+                // `mobile` replaces the dropped `User.studentId` as
+                // the per-account identifier surfaced on the admin
+                // roster. The per-enrollment `studentCourseId` for
+                // the exam course is fetched separately below.
+                select: { mobile: true, name: true, nickname: true },
               },
               batches: {
                 where: { isDeleted: false },
@@ -1112,7 +1117,10 @@ const getExamByIdToDB = async (id: string) => {
       resultId: r.id,
       studentId: r.studentId,
       studentName: r.student.user.name,
-      studentCode: r.student.user.studentId,
+      // Mobile replaces `User.studentId` as the per-account
+      // identifier for the barcode / lookup field on the exam
+      // roster.
+      studentCode: r.student.user.mobile,
       obtainedMarks: r.obtainedMarks,
       rank: r.rank ?? null,
     }));
@@ -1149,7 +1157,9 @@ const getExamByIdToDB = async (id: string) => {
       id: r.id,
       studentId: r.studentId,
       studentName: r.student.user.name,
-      studentCode: r.student.user.studentId,
+      // Mobile replaces `User.studentId` for the barcode / lookup
+      // field on the exam roster.
+      studentCode: r.student.user.mobile,
       studentMobile: r.student.mobile,
       studentCollege: r.student.college ?? null,
       // `batches` is filtered to non-deleted in the Prisma include. We pass

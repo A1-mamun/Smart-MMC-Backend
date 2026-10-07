@@ -90,4 +90,39 @@ router.patch(
   CourseController.toggleAdmitAnotherCourse,
 );
 
+/**
+ * Per-slot "take attendance" toggle. PATCH body:
+ *   { batchDayId, slotIndex, enabled }
+ * The service flips that single slot in `BatchDay.slotStates` and
+ * auto-disables the other slots in the same BatchDay so the kiosk
+ * can never serve two slots concurrently (the "only one slot ON
+ * at a time" rule). Re-validating all 4 fields (including the
+ * UUID) keeps the endpoint safe from the admin dashboard's
+ * auto-save pattern.
+ */
+router.patch(
+  '/:id/slot-toggle',
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
+  writeOperationRateLimiter,
+  validateRequest(CourseValidation.toggleBatchSlotSchema),
+  CourseController.toggleBatchSlot,
+);
+
+/**
+ * Per-slot "check-in window override" toggle. The admin uses
+ * this when they want the kiosk to accept scans for a slot
+ * outside the default 5-minute window — e.g. opening the
+ * window early for an early arrival, or keeping it open
+ * past the 5-min mark (e.g. when the class is delayed).
+ * The override is per-slot and independent of the
+ * `slot-toggle` admit gate.
+ */
+router.patch(
+  '/:id/slot-window-override',
+  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
+  writeOperationRateLimiter,
+  validateRequest(CourseValidation.setSlotWindowOverrideSchema),
+  CourseController.setSlotWindowOverride,
+);
+
 export const CourseRoutes = router;

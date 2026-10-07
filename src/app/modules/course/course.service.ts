@@ -9,11 +9,58 @@ import {
   TGetAllCourses,
   TBatchDayInput,
   TSetStatus,
-  TToggleAdmitAnotherCourse,
+  // TToggleAdmitAnotherCourse,
 } from './course.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearCourseCache } from '../../utils/clearCache';
 import { checkBatchTimeConflict } from '../../utils/checkBatchTimeConflict';
+
+/**
+ * Per-slot "barcode scan allowed right now" flag, parallel to
+ * `times[]`. Strictly binary — no tri-state, no auto-cycle:
+ * the admin turns a slot ON at class start and OFF at class
+ * end. The kiosk treats `true` as "admit scans for this slot"
+ * and `false` as "reject scans". The cross-course "only one
+ * ON" invariant is enforced at write time by
+ * `toggleBatchSlotToDB` (turning one slot ON auto-disables
+ * every other slot in the database).
+ *
+ * Length must match `times[]`; the backend pads/trims to keep
+ * the arrays in sync.
+ */
+const normaliseSlotStates = (incoming: boolean[] | undefined, timesLength: number): boolean[] =>
+  normaliseBooleanArray(incoming, timesLength, false);
+
+/**
+ * Pad / trim a per-slot boolean array to match `times.length`.
+ * Used by the create / update paths so the parallel arrays
+ * (slotStates, manualWindowOverride, …) always stay in sync
+ * with the canonical `times[]` shape. Behaviour:
+ *   - Empty / undefined `incoming` → all `defaultValue` (e.g.
+ *     `false` for the "off by default" fields, `true` for the
+ *     "on by default" fields).
+ *   - Truncated if the admin SHRUNK `times[]` (e.g. dropped a
+ *     slot) — extra flags are discarded.
+ *   - Padded with `defaultValue` if the admin EXTENDED
+ *     `times[]` (e.g. added a slot) — new slots default to
+ *     `defaultValue` so a quick edit doesn't accidentally
+ *     flip a new slot to the opposite state.
+ */
+const normaliseBooleanArray = (
+  incoming: boolean[] | undefined,
+  timesLength: number,
+  defaultValue: boolean,
+): boolean[] => {
+  const result: boolean[] = [];
+  for (let i = 0; i < timesLength; i++) {
+    if (incoming && i < incoming.length) {
+      result.push(Boolean(incoming[i]));
+    } else {
+      result.push(defaultValue);
+    }
+  }
+  return result;
+};
 
 const courseInclude = {
   batchDays: {
@@ -46,20 +93,39 @@ const createCourseToDB = async (payload: TCreateCourse) => {
         description: payload.description,
         fee: new Prisma.Decimal(payload.fee),
         hscBatch: payload.hscBatch,
-        // Persist the cap verbatim when supplied; let the Prisma
-        // `@default(120)` take over when the field is missing. The
-        // "explicit null = uncapped" path means we only persist
-        // `null` when the client intentionally sent null.
-        totalSeats: payload.totalSeats === undefined ? undefined : payload.totalSeats,
+        // Persist the seat cap verbatim. `totalSeats` is now
+        // REQUIRED on the create schema (1..10000) so by the
+        // time we reach this branch it's always a positive
+        // integer. The Prisma column stays nullable for
+        // backward compat with legacy rows — those were
+        // written before the field was made required and
+        // still render the "Uncapped" badge.
+        totalSeats: payload.totalSeats,
       },
     });
     for (const [position, day] of payload.batchDays.entries()) {
+      // Pad slotStates to match times.length (legacy rows + first-time
+      // creates default to all-ON). The "exactly one ON" invariant
+      // is enforced on read in getCurrentBatchFromDB, not here —
+      // admins can create a batch with multiple slots all-ON;
+      // the service flips siblings OFF the moment the admin toggles
+      // a slot in the UI. Keeping create permissive avoids rejecting
+      // a perfectly valid initial state ("all slots admitting").
+      const slotStates = normaliseSlotStates(day.slotStates, day.times.length);
+      const manualWindowOverride = normaliseBooleanArray(
+        day.manualWindowOverride,
+        day.times.length,
+        false,
+      );
       await tx.batchDay.create({
         data: {
           courseId: course.id,
           name: day.name,
           days: day.days,
           times: day.times,
+          durationMinutes: day.durationMinutes,
+          slotStates,
+          manualWindowOverride,
           position,
         },
       });
@@ -166,8 +232,9 @@ const getCourseSeatsFromDB = async (courseId: string) => {
         batchTime: r.batchTime,
         enrolled: r._count._all ?? 0,
       }))
-      .filter((s): s is { batchDayId: string; batchTime: string; enrolled: number } =>
-        s.batchDayId != null,
+      .filter(
+        (s): s is { batchDayId: string; batchTime: string; enrolled: number } =>
+          s.batchDayId != null,
       ),
   };
 };
@@ -208,6 +275,40 @@ const getCourseSeatsFromDB = async (courseId: string) => {
 
 const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
   const data: Prisma.CourseUpdateInput = {};
+
+  // Status-aware slotStates gate: only `ONGOING` courses can have
+  // a non-default slotStates array applied. For `ADMISSION` /
+  // `COMPLETE` courses we strip the field from the payload — the
+  // existing per-BatchDay `slotStates` in the DB is preserved (so
+  // a course that transitions ONGOING → COMPLETE keeps its last
+  // admitted-slot state, even though the rule itself is only
+  // enforced for ONGOING courses). The `slotStates` for a
+  // freshly-created ADMISSION row is the all-ON default from
+  // `normaliseSlotStates`, which is the only safe value the rule
+  // accepts.
+  if (payload.batchDays) {
+    const existing = await prisma.course.findUnique({
+      where: { id },
+      select: { status: true },
+    });
+    if (!existing) {
+      throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
+    }
+    if (existing.status !== 'ONGOING') {
+      // Strip slotStates from every batchDay before propagation so
+      // the per-BatchDay `slotStates` is preserved verbatim. The
+      // admin can flip the course to ONGOING first (via the status
+      // segmented control), then toggle individual slots.
+      payload = {
+        ...payload,
+        batchDays: payload.batchDays.map((d) => ({
+          ...d,
+          durationMinutes: d.durationMinutes,
+          slotStates: undefined,
+        })),
+      };
+    }
+  }
 
   if (payload.name !== undefined) {
     data.name = payload.name;
@@ -308,7 +409,7 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
     if (payload.batchDays) {
       const existingDays = await tx.batchDay.findMany({
         where: { courseId: id },
-        select: { id: true, name: true },
+        select: { id: true, name: true, times: true },
       });
       const existingById = new Map(existingDays.map((d) => [d.id, d]));
       const existingIds = new Set(existingDays.map((d) => d.id));
@@ -317,10 +418,26 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
       );
 
       for (const [position, day] of payload.batchDays.entries()) {
+        // Pad slotStates to match the (possibly edited) times[]
+        // length. If the admin omitted slotStates in the form
+        // payload, default to all-ON so legacy / first-time writes
+        // continue to accept scans until the admin explicitly
+        // toggles a slot OFF. The "exactly one ON" invariant is
+        // enforced by the kiosk toggle action, not here.
+        const slotStates = normaliseSlotStates(day.slotStates, day.times.length);
+        const manualWindowOverride = normaliseBooleanArray(
+          day.manualWindowOverride,
+          day.times.length,
+          // Default to false — absent values mean "use the
+          // default 5-min window", the same as an explicit false.
+          false,
+        );
         const dayData = {
           name: day.name,
           days: day.days,
           times: day.times,
+          slotStates,
+          manualWindowOverride,
           position,
         };
         if (day.id && existingById.has(day.id)) {
@@ -345,6 +462,178 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
               where: { batchDayId: day.id, isDeleted: false },
               data: { batchDay: day.name },
             });
+          }
+
+          /*
+           * Propagate the `times[]` change to every StudentBatch
+           * row that points at this BatchDay. StudentBatch stores
+           * `batchTime` denormalized (the per-enrollment slot
+           * time) so the swap-resolver, the 5-min check-in window
+           * guard, and the admin's per-batch filters all see the
+           * new time without a fresh admit / re-enroll round-trip.
+           *
+           * Critical correctness rule: each per-slot rename must
+           * update ONLY the students that were in THAT slot at
+           * the start of the transaction. Concretely — if the
+           * admin renames `times[0] = "3:00 AM"` → `"3:30 AM"`,
+           * the 2 students enrolled in the 3:00 AM slot must
+           * follow their slot to 3:30 AM, while the 2 students
+           * in the 4:00 AM slot must stay at 4:00 AM. We must
+           * NOT clobber the 4:00 AM students into 3:30 AM as
+           * well.
+           *
+           * Naive per-row updateMany ({ where: { batchTime: oldTime } })
+           * is wrong for two reasons:
+           *
+           *   1. SWAP / COLLISION: if the admin reorders times
+           *      so that an old value reappears at a different
+           *      index, step N's `where batchTime: oldTime` will
+           *      also match rows that an earlier step just moved
+           *      into that value. Example — `["3:00 AM", "4:00 AM"]`
+           *      → `["4:00 AM", "3:30 AM"]`:
+           *        step 0: UPDATE WHERE batchTime="3:00 AM" → "4:00 AM"
+           *          → 2 students now at "4:00 AM"
+           *        step 1: UPDATE WHERE batchTime="4:00 AM" → "3:30 AM"
+           *          → matches the 2 ORIGINAL "4:00 AM" students
+           *            PLUS the 2 just-moved "3:00 AM" students.
+           *            All 4 end up at "3:30 AM". Wrong.
+           *
+           *   2. ORPHAN SWEEP over-reach: the prior code followed
+           *      the per-slot pass with a `where batchTime NOT IN
+           *      newTimes` sweep that reassigned every "drifted"
+           *      row to `newTimes[0]`. The intent was to catch
+           *      legacy seed rows whose batchTime was no longer
+           *      in the catalog, but in practice it also pulled
+           *      in rows that had been moved by the per-slot
+           *      pass to a new value that happened to also be a
+           *      target — producing cascading rewrites.
+           *
+           * Fix: snapshot the per-slot membership of
+           * StudentBatch at the START of the per-slot loop
+           * (captured before any UPDATE runs), then drive the
+           * per-slot UPDATEs by StudentBatch.id rather than by
+           * the mutable `batchTime` column. This is collision-
+           * safe regardless of how the new times[] is ordered
+           * relative to the old.
+           */
+          const previousTimes = previous?.times ?? [];
+          const newTimes = day.times;
+
+          if (previousTimes.length > 0 && newTimes.length > 0) {
+            // Snapshot: which StudentBatch rows were in each old slot?
+            // We capture { id, batchTime } so we can rewrite by id
+            // below — ids are stable for the lifetime of the
+            // transaction, whereas `batchTime` is the column we're
+            // mutating.
+            const snapshot = await tx.studentBatch.findMany({
+              where: { batchDayId: day.id, isDeleted: false },
+              select: { id: true, batchTime: true },
+            });
+
+            // Bucket snapshot rows by their original `batchTime`.
+            // Rows with a `batchTime` that doesn't match any
+            // previous slot (legacy drift from earlier seeds) go
+            // into the `null` bucket for the orphan pass.
+            const byOldTime = new Map<string, string[]>();
+            for (const row of snapshot) {
+              const list = byOldTime.get(row.batchTime) ?? [];
+              list.push(row.id);
+              byOldTime.set(row.batchTime, list);
+            }
+
+            // Track every value we've decided a StudentBatch row
+            // can end up with during this transaction — the
+            // union of the new times[] and any of the
+            // previously-existing times that we're about to map
+            // onto a new value. The orphan pass below only
+            // rewrites rows whose `batchTime` is in NEITHER
+            // set, so we don't accidentally re-clobber rows we
+            // just intentionally moved.
+            const assignedTimes = new Set<string>(newTimes);
+
+            // Per-slot rename: walk the OLD times[] positions
+            // and, for each, rewrite the students that started
+            // in that slot to the corresponding new time. Use
+            // the snapshot's ids so we're immune to mid-loop
+            // mutations.
+            //
+            // Two cases for `newTime`:
+            //   - Admin kept slot i (newTimes[i] is defined and
+            //     differs from previousTimes[i]): rename in
+            //     place, e.g. "3:00 AM" → "3:30 AM".
+            //   - Admin DROPPED slot i (newTimes[i] is undefined
+            //     because the new array is shorter): the students
+            //     that were in the dropped slot need a
+            //     re-home. We pick `newTimes[0]` (the surviving
+            //     first slot) so the enrollment doesn't go
+            //     dangling — the admin can re-edit to a specific
+            //     slot later. This is a best-effort safety net
+            //     for explicit slot removal.
+            for (let slotIdx = 0; slotIdx < previousTimes.length; slotIdx++) {
+              const oldTime = previousTimes[slotIdx];
+              const ids = byOldTime.get(oldTime) ?? [];
+              if (ids.length === 0) continue;
+              const newTime = slotIdx < newTimes.length ? newTimes[slotIdx] : newTimes[0];
+              if (oldTime === newTime) continue;
+              // Use a chunked write only because updateMany's
+              // `data` shape is a single value, not per-row —
+              // every id in the bucket shares the same target
+              // time so a single updateMany is correct.
+              await tx.studentBatch.updateMany({
+                where: { id: { in: ids }, isDeleted: false },
+                data: { batchTime: newTime },
+              });
+              // Add the target time to the "live" set so the
+              // orphan pass below doesn't treat a freshly-
+              // assigned value as drift. (Note: the OLD time
+              // is what we want the orphan pass to recognise
+              // as already-handled — and that's implicit
+              // because we already processed its bucket in
+              // this loop iteration. The orphan pass only
+              // sees `byOldTime` keys that AREN'T in
+              // `assignedTimes`; since `assignedTimes`
+              // already contained the new times at start-up,
+              // the only way a key can be in the orphan set
+              // is if its rows were already handled above OR
+              // were genuinely stale from before this
+              // transaction.)
+              assignedTimes.add(newTime);
+            }
+
+            // Orphan pass: any StudentBatch whose ORIGINAL
+            // batchTime is neither a value the admin kept
+            // (in newTimes) nor a value we just deliberately
+            // mapped somewhere. This is the safety net for
+            // legacy seed rows whose batchTime drifted from
+            // BatchDay.times[] long ago (e.g. an earlier
+            // schema migration that didn't propagate). We
+            // re-home them to newTimes[0] so the enrollment
+            // doesn't go dangling.
+            //
+            // We deliberately do NOT include rows whose only
+            // "drift" is that they're about to be (or just
+            // were) rewritten by the per-slot pass. Those rows
+            // are already accounted for above.
+            const orphanTimes: string[] = [];
+            for (const oldTime of byOldTime.keys()) {
+              if (!assignedTimes.has(oldTime)) orphanTimes.push(oldTime);
+            }
+            if (orphanTimes.length > 0) {
+              // Re-read any rows whose batchTime is in the
+              // orphan set AND wasn't rewritten by the
+              // per-slot pass above (which used the snapshot
+              // ids, so the only way a row is still at an
+              // orphan time is if it was orphaned before
+              // this transaction even started).
+              await tx.studentBatch.updateMany({
+                where: {
+                  batchDayId: day.id,
+                  batchTime: { in: orphanTimes },
+                  isDeleted: false,
+                },
+                data: { batchTime: newTimes[0] },
+              });
+            }
           }
         } else {
           // No matching id (or id not provided) — create a new row.
@@ -441,11 +730,7 @@ const toggleCourseAdmitAnotherCourseToDB = async (
  * single auditable hook (and the actor `user` is in scope). Stamps
  * `completedBy` only on the COMPLETE transition.
  */
-const setCourseStatusToDB = async (
-  id: string,
-  payload: TSetStatus['body'],
-  user: JwtPayload,
-) => {
+const setCourseStatusToDB = async (id: string, payload: TSetStatus['body'], user: JwtPayload) => {
   const existing = await prisma.course.findUnique({ where: { id } });
   if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
 
@@ -477,6 +762,238 @@ const deleteCourseFromDB = async (id: string) => {
   return null;
 };
 
+/**
+ * Flip a single slot's `slotEnabled` flag.
+ *
+ * Cross-course invariant (the "one at a time" rule): only one
+ * slot can be ON across ALL BatchDays of ALL courses at any
+ * time. Flipping a slot ON in course A auto-disables every
+ * other slot in every other course so the kiosk can never
+ * serve two slots concurrently — the operator can only ever
+ * have one live-admit slot open system-wide.
+ *
+ * Flipping a slot OFF leaves siblings alone — turning off the
+ * lone ON slot results in zero ON, which is the admin's intent
+ * (they can pick another slot to enable next).
+ *
+ * Status gate: only `ONGOING` courses can have slot states
+ * toggled. The "exactly one ON" rule is only meaningful for
+ * active classes — an ADMISSION course hasn't started yet, and
+ * a COMPLETE course has already graduated, so neither has a
+ * need for a live-admit slot. Reject toggles on non-ONGOING
+ * courses with a 400 so the Courses page UI can hide the
+ * switch entirely.
+ */
+const toggleBatchSlotToDB = async (
+  courseId: string,
+  payload: {
+    batchDayId: string;
+    slotIndex: number;
+    enabled: boolean;
+  },
+  user: JwtPayload,
+) => {
+  const course = await prisma.course.findUnique({ where: { id: courseId } });
+  if (!course) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
+  if (course.status !== 'ONGOING') {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      `Slot toggling is only allowed on ONGOING courses. This course is currently ${course.status}. Move it to ONGOING first via the status segmented control.`,
+    );
+  }
+
+  const batchDay = await prisma.batchDay.findUnique({
+    where: { id: payload.batchDayId },
+    select: { id: true, courseId: true, times: true, slotStates: true },
+  });
+  if (!batchDay || batchDay.courseId !== courseId) {
+    throw new AppError(httpStatus.NOT_FOUND, 'BatchDay not found in this course');
+  }
+  if (payload.slotIndex < 0 || payload.slotIndex >= batchDay.times.length) {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      `slotIndex ${payload.slotIndex} is out of range (BatchDay has ${batchDay.times.length} slots)`,
+    );
+  }
+
+  /*
+   * Cross-course scope: pull EVERY BatchDay across the database
+   * (joined to the parent course so we have the course name
+   * for the activity log). This is a single round-trip — the
+   * `BatchDay` table is small (a few dozen rows even on a
+   * large install) so the in-memory sweep is fast and avoids
+   * a per-row write loop. We pad / normalise each row's
+   * `slotStates` to its `times.length` so the new flag lands
+   * on the correct index even for legacy rows with a short
+   * array.
+   */
+  const allBatchDays = await prisma.batchDay.findMany({
+    select: {
+      id: true,
+      times: true,
+      slotStates: true,
+      course: { select: { id: true, name: true } },
+    },
+  });
+
+  const updates: Array<{ id: string; slotStates: boolean[] }> = [];
+  for (const bd of allBatchDays) {
+    const padded = normaliseSlotStates(bd.slotStates, bd.times.length);
+    if (payload.enabled) {
+      /*
+       * Admin forced this slot ON — override any other manual
+       * ON across the system (per the user's "only one manual
+       * ON at a time" rule). The target slot flips to `true`;
+       * every other slot in the database flips to `false` so the
+       * kiosk can never serve two slots concurrently. Sibling
+       * slots that were previously ON are now OFF — that's
+       * intentional: turning one slot ON in course A means no
+       * other course can have a live-admit slot open, and the
+       * operator has to manually re-enable a slot in course B
+       * (or another slot in course A) when they want to switch.
+       */
+      for (let i = 0; i < padded.length; i++) {
+        if (bd.id === batchDay.id && i === payload.slotIndex) {
+          padded[i] = true;
+        } else {
+          padded[i] = false;
+        }
+      }
+    } else {
+      // Admin forced this slot OFF — only the target slot
+      // flips; siblings everywhere stay as they are.
+      if (bd.id === batchDay.id) {
+        padded[payload.slotIndex] = false;
+      }
+    }
+    updates.push({ id: bd.id, slotStates: padded });
+  }
+
+  // Apply all updates in a single transaction so the global
+  // invariant either holds across every row or rolls back
+  // together. Each update is independent so the array
+  // iteration is fine; the $transaction wrapper is what
+  // makes "all rows update or none" possible.
+  await prisma.$transaction(
+    updates.map((u) =>
+      prisma.batchDay.update({
+        where: { id: u.id },
+        data: { slotStates: u.slotStates },
+      }),
+    ),
+  );
+
+  // Re-read the target row so the response carries the
+  // post-update slotStates array (used by the toast / UI to
+  // confirm the toggle landed).
+  const updated = await prisma.batchDay.findUnique({
+    where: { id: batchDay.id },
+    include: { course: { select: { id: true, name: true } } },
+  });
+  if (!updated) {
+    throw new AppError(httpStatus.INTERNAL_SERVER_ERROR, 'BatchDay vanished mid-toggle');
+  }
+
+  await prisma.activityLog.create({
+    data: {
+      actorId: user.userId,
+      actorRole: user.role as 'SUPER_ADMIN' | 'ADMIN',
+      action: 'BATCH_SLOT_TOGGLED',
+      entityType: 'BatchDay',
+      entityId: updated.id,
+      description: `${updated.course.name} · ${updated.name} slot ${payload.slotIndex + 1} (${updated.times[payload.slotIndex]}) ${payload.enabled ? 'ENABLED' : 'DISABLED'}`,
+      metadata: {
+        courseId: updated.courseId,
+        batchDayId: updated.id,
+        slotIndex: payload.slotIndex,
+        enabled: payload.enabled,
+      },
+    },
+  });
+
+  await clearCourseCache();
+  return updated;
+};
+
+/**
+ * Toggle the per-slot "check-in window override" flag. The
+ * default check-in window opens at class start and closes 5
+ * minutes after; this override lets the admin open the
+ * window early (e.g. admit a parent who's early) or keep
+ * it open past the 5-min mark (e.g. when the class was
+ * delayed). The override is per-slot, independent of the
+ * `slotStates[i]` admit flag — a slot can have the override
+ * on while still being admit-disabled, but the kiosk's
+ * check-in guard rejects scans for disabled slots
+ * regardless of the override state.
+ *
+ * Updates only the targeted `manualWindowOverride[i]` element;
+ * siblings are untouched. The service writes back the
+ * full padded array so the parallel shape stays in sync
+ * with `times[]`.
+ */
+const setSlotWindowOverrideToDB = async (
+  courseId: string,
+  payload: {
+    batchDayId: string;
+    slotIndex: number;
+    open: boolean;
+  },
+  user: JwtPayload,
+) => {
+  const course = await prisma.course.findUnique({ where: { id: courseId } });
+  if (!course) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
+  if (course.status !== 'ONGOING') {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      `Slot window override is only available on ONGOING courses. This course is currently ${course.status}.`,
+    );
+  }
+
+  const batchDay = await prisma.batchDay.findUnique({
+    where: { id: payload.batchDayId },
+    select: { id: true, courseId: true, manualWindowOverride: true, times: true },
+  });
+  if (!batchDay || batchDay.courseId !== courseId) {
+    throw new AppError(httpStatus.NOT_FOUND, 'BatchDay not found in this course');
+  }
+  if (payload.slotIndex < 0 || payload.slotIndex >= batchDay.times.length) {
+    throw new AppError(
+      httpStatus.BAD_REQUEST,
+      `slotIndex ${payload.slotIndex} is out of range (BatchDay has ${batchDay.times.length} slots)`,
+    );
+  }
+
+  const padded = normaliseBooleanArray(batchDay.manualWindowOverride, batchDay.times.length, false);
+  padded[payload.slotIndex] = payload.open;
+
+  const updated = await prisma.batchDay.update({
+    where: { id: batchDay.id },
+    data: { manualWindowOverride: padded },
+    include: { course: { select: { id: true, name: true } } },
+  });
+
+  await prisma.activityLog.create({
+    data: {
+      actorId: user.userId,
+      actorRole: user.role as 'SUPER_ADMIN' | 'ADMIN',
+      action: 'BATCH_SLOT_WINDOW_OVERRIDE_TOGGLED',
+      entityType: 'BatchDay',
+      entityId: updated.id,
+      description: `${updated.course.name} · ${updated.name} slot ${payload.slotIndex + 1} (${updated.times[payload.slotIndex]}) window ${payload.open ? 'OPEN' : 'CLOSED'}`,
+      metadata: {
+        courseId: updated.courseId,
+        batchDayId: updated.id,
+        slotIndex: payload.slotIndex,
+        open: payload.open,
+      },
+    },
+  });
+
+  await clearCourseCache();
+  return updated;
+};
+
 export const CourseService = {
   createCourseToDB,
   getAllCoursesFromDB,
@@ -486,6 +1003,8 @@ export const CourseService = {
   toggleCourseActiveToDB,
   toggleCourseAdmitAnotherCourseToDB,
   setCourseStatusToDB,
+  toggleBatchSlotToDB,
+  setSlotWindowOverrideToDB,
   deleteCourseFromDB,
 };
 

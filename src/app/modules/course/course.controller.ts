@@ -1,9 +1,11 @@
 import httpStatus from 'http-status';
+import { JwtPayload } from 'jsonwebtoken';
 import catchAsync from '../../utils/catchAsync';
 import sendResponse from '../../utils/sendResponse';
 import { CourseService } from './course.service';
 import pick from '../../utils/pick';
 import { paginationFields } from '../../constant/pagination';
+import { TSetSlotWindowOverride } from './course.validation';
 
 const createCourse = catchAsync(async (req, res) => {
   const result = await CourseService.createCourseToDB(req.body);
@@ -133,6 +135,55 @@ const toggleAdmitAnotherCourse = catchAsync(async (req, res) => {
   });
 });
 
+/**
+ * Per-slot "Take attendance" toggle. The Courses page renders a
+ * small switch next to every times[] entry; flipping one ON
+ * auto-disables every other slot in the same BatchDay so the
+ * kiosk can never serve two slots concurrently. See
+ * `toggleBatchSlotToDB` for the in-memory sibling-disabling
+ * logic.
+ */
+const toggleBatchSlot = catchAsync(async (req, res) => {
+  const result = await CourseService.toggleBatchSlotToDB(
+    req.params.id as string,
+    req.body,
+    req.user as JwtPayload,
+  );
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: req.body.enabled
+      ? `Attendance enabled for ${result.name} · ${result.times[req.body.slotIndex]}.`
+      : `Attendance disabled for ${result.name} · ${result.times[req.body.slotIndex]}.`,
+    data: result,
+  });
+});
+
+/**
+ * Per-slot "check-in window override" toggle. The admin uses
+ * this when they want the kiosk to accept scans for a slot
+ * outside the default 5-minute window — open the window
+ * early (e.g. admit an early arrival) or keep it open past
+ * the 5-min mark (e.g. when the class is delayed). The
+ * Courses page surfaces this as a Switch next to the
+ * existing "Take attendance" toggle.
+ */
+const setSlotWindowOverride = catchAsync(async (req, res) => {
+  const result = await CourseService.setSlotWindowOverrideToDB(
+    req.params.id as string,
+    req.body as TSetSlotWindowOverride['body'],
+    req.user as JwtPayload,
+  );
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: req.body.open
+      ? `Check-in window override OPEN for ${result.name} · ${result.times[req.body.slotIndex]}. Scans accepted regardless of the wall clock.`
+      : `Check-in window override CLOSED for ${result.name} · ${result.times[req.body.slotIndex]}. Default 5-min window applies.`,
+    data: result,
+  });
+});
+
 export const CourseController = {
   createCourse,
   getAllCourses,
@@ -143,4 +194,6 @@ export const CourseController = {
   toggleActive,
   setStatus,
   toggleAdmitAnotherCourse,
+  toggleBatchSlot,
+  setSlotWindowOverride,
 };
