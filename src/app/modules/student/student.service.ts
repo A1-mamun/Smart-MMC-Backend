@@ -3,6 +3,8 @@
 import httpStatus from 'http-status';
 import bcrypt from 'bcrypt';
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
 import { Prisma } from '@prisma/client';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
@@ -12,6 +14,18 @@ import { TAdmitStudent, TUpdateStudent, TGetAllStudents } from './student.valida
 import calculatePagination from '../../utils/calculatePagination';
 import { clearStudentCache } from '../../utils/clearCache';
 import { JwtPayload } from 'jsonwebtoken';
+
+// Extend dayjs with tz-aware plugins here so the inline `weekdayNameFor`
+// helper below can use them. Idempotent — classDayCalendar.ts also
+// extends these, but this module imports dayjs directly so it has to
+// extend on its own.
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+// Pull in instituteLocalDate so the absentOnDate filter below can
+// pass Prisma a JS Date whose UTC date parts equal the BD-local day
+// (Prisma's PG driver stores that as the @db.Date column value).
+import { instituteLocalDate } from '../../utils/classDayCalendar';
 
 /**
  * Narrow payload used when an admin enrolls an EXISTING student into a
@@ -37,8 +51,16 @@ export type TEnrollExistingStudent = {
  * the comparison on the call site — this helper just normalises the JS
  * output for direct array membership tests.
  */
-const weekdayNameFor = (d: Date): string =>
-  ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()];
+// Local copy of weekdayNameFor. The original helper in
+// `classDayCalendar.ts` (imported elsewhere) uses the institute TZ
+// for `.getDay()` — this local version stays consistent by going
+// through the same tz pipeline so admin filter inputs (e.g.
+// `?classDate=2026-10-08` — a BD-class-day) line up with the
+// BatchDay.days[] values the admin configured.
+const weekdayNameFor = (d: Date): string => {
+  const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  return names[dayjs.utc(d).tz('Asia/Dhaka').day()];
+};
 
 /**
  * Normalise an optional stringly-typed payload field to a real `null`
@@ -60,8 +82,7 @@ const nullIfEmpty = <T>(v: T | undefined | null): T | null => {
  * only validates the parsed Zod result and discards it, so the raw
  * URL-encoded string ("true" / "1") reaches the service even though the
  * schema's *output* type is `boolean`. Compare against the common truthy
- * shapes here so scenario toggles like `hasDue` and `activeCoursesOnly`
- * actually take effect.
+ * shapes here so the `hasDue` scenario toggle actually takes effect.
  */
 const isTruthyQuery = (v: unknown): boolean => v === true || v === 'true' || v === '1' || v === 1;
 
@@ -174,9 +195,6 @@ const resolveBatchDayForCourse = async (
   });
   if (!course || course.isDeleted) {
     throw new AppError(httpStatus.BAD_REQUEST, 'Selected course not found');
-  }
-  if (!course.isActive) {
-    throw new AppError(httpStatus.BAD_REQUEST, 'Selected course is not active');
   }
   // A course in the COMPLETE stage has "graduated" — no new admits
   // or re-enrollments are allowed. The frontend filters COMPLETE
@@ -581,9 +599,9 @@ const getAllStudentsFromDB = async (
 ) => {
   const { page, limit, skip, sortBy, sortOrder } = calculatePagination(options);
   // Pull every known query key out of `filters` so the SMS scenario keys
-  // (classDate, classTime, scenarioCourses, hasDue, activeCoursesOnly) and
-  // the legacy fields don't leak into `rest` and end up passed to Prisma
-  // as raw `where: { classDate: "..." }` clauses — Prisma rejects unknown
+  // (classDate, classTime, scenarioCourses, hasDue) and the legacy
+  // fields don't leak into `rest` and end up passed to Prisma as raw
+  // `where: { classDate: "..." }` clauses — Prisma rejects unknown
   // argument names with "Unknown argument `classDate`".
   const {
     searchTerm,
@@ -602,7 +620,6 @@ const getAllStudentsFromDB = async (
     classTime,
     scenarioCourses,
     hasDue,
-    activeCoursesOnly,
     absentOnDate,
     // Free vs paid segregation. `isFreeAccount` is tri-state on the
     // query side: undefined → no filter (returns everyone); true →
@@ -631,9 +648,9 @@ const getAllStudentsFromDB = async (
   // access, so any middleware-side coercion is silently discarded by the
   // time the controller reads `req.query`. Doing it here, once, makes the
   // boolean flow through the rest of the function untouched. (Mirrors the
-  // existing `isTruthyQuery` helper used for `hasDue` / `activeCoursesOnly`,
-  // but those flow through `if (isTruthyQuery(...))` rather than directly
-  // into a Prisma WHERE clause — so they don't need this fix.)
+  // existing `isTruthyQuery` helper used for `hasDue`,
+  // which flows through `if (isTruthyQuery(...))` rather than directly
+  // into a Prisma WHERE clause — so it doesn't need this fix.)
   //
   // The `isFreeAccount` parameter is typed as `boolean | undefined` because
   // the Zod schema's `.transform()` returns a real boolean. We still keep
@@ -672,12 +689,23 @@ const getAllStudentsFromDB = async (
     andConditions.push({
       OR: [
         // Mobile doubles as the login handle — searchable so admins
-        // can find a student by phone number. The dropped
-        // `user.studentId` global handle is replaced by mobile.
+        // can find a student by phone number.
         { mobile: { contains: searchTerm, mode: 'insensitive' } },
         { addressDistrict: { contains: searchTerm, mode: 'insensitive' } },
         { user: { is: { name: { contains: searchTerm, mode: 'insensitive' } } } },
         { user: { is: { nickname: { contains: searchTerm, mode: 'insensitive' } } } },
+        // Per-enrollment printable student ID (e.g. "271200"). Lives on
+        // StudentCourse, not User, since each enrollment gets its own
+        // receipt handle. The dropped `user.studentId` global handle
+        // is replaced here so admins can still search by the printed
+        // ID on the Students page and the SMS picker.
+        {
+          studentCourses: {
+            some: {
+              studentCourseId: { contains: searchTerm, mode: 'insensitive' },
+            },
+          },
+        },
       ],
     });
   }
@@ -839,52 +867,47 @@ const getAllStudentsFromDB = async (
     });
   }
 
-  // (d) Active-courses-only filter.
-  if (isTruthyQuery(activeCoursesOnly)) {
-    andConditions.push({
-      studentCourses: {
-        some: {
-          isDeleted: false,
-          course: { isActive: true, isDeleted: false },
-        },
-      },
-    });
-  }
-
-  // (e) Absent-on-date filter — feeds the absent-warning SMS picker.
-  //     Resolves to "expected students on this weekday minus students
-  //     with an Attendance row on this exact date". Implemented in two
-  //     passes because the cohort + present subtraction cross-tables,
-  //     and a single `NOT EXISTS` against `attendance` would fail to
-  //     account for the "expected" half (the student only counts as
-  //     absent if they were enrolled in a class that day).
+  // (d) Absent-on-date filter — feeds the absent-warning SMS picker.
+  //     Per spec the picker should show students the system has
+  //     RECORDED as absent on the selected date. We look at the
+  //     `Attendance.status` column directly: keep only students who
+  //     have an Attendance row with `status = 'ABSENT'` for
+  //     `targetDate`. The cron in
+  //     `attendance.service.ts → markAbsenteesForFinishedSlotsToDB`
+  //     is the canonical writer of these rows — it inserts an
+  //     ABSENT row for every enrolled student who didn't scan by
+  //     the time the slot finishes. So a non-empty result here
+  //     means "students we already know were absent that day".
+  //
+  //     The earlier "expected minus present" two-pass form
+  //     (cohort of enrolled students, then NOT EXISTS any
+  //     Attendance row) was too broad: it returned students with
+  //     no Attendance row at all, including ones whose slot
+  //     hadn't finished yet and whose ABSENT row hadn't been
+  //     written yet, so the picker would falsely surface
+  //     in-flight students as absent. The status-based form
+  //     matches what the admin actually sees in the Attendance
+  //     page (which already renders the per-row status badge),
+  //     so the picker and the table stay in sync.
   if (absentOnDate) {
-    const targetDate = dayjs(absentOnDate).startOf('day').toDate();
-    const weekday = weekdayNameFor(targetDate);
-    // (e.1) Narrow cohort to students with a batch on this weekday.
-    const matchingBatchDays = await prisma.batchDay.findMany({
-      where: {
-        days: { has: weekday },
-        course: { isDeleted: false },
-      },
-      select: { id: true, days: true },
-    });
-    const lowerWeekday = weekday.toLowerCase();
-    const batchDayIds = matchingBatchDays
-      .filter((b) => b.days.some((d) => d.toLowerCase() === lowerWeekday))
-      .map((b) => b.id);
-    if (batchDayIds.length === 0) {
-      andConditions.push({ id: { in: [] } });
-    } else {
-      andConditions.push({
-        batches: { some: { batchDayId: { in: batchDayIds }, isDeleted: false } },
-      });
-    }
-    // (e.2) Subtract present. We use `NOT` on a where-clause against
-    //       Attendance — Prisma compiles this to a NOT EXISTS subquery.
+    // `targetDate` is a JS Date whose UTC date parts equal the BD-local
+    // calendar day, so it round-trips correctly through Prisma's
+    // @db.Date column when used in the `attendance.date` filter below.
+    // (The helper is in classDayCalendar.ts — see instituteLocalDate's
+    // docstring for why we can't use server-local midnight here.)
+    const targetDate = instituteLocalDate(absentOnDate);
+    // Single relation filter: "the student has at least one
+    // Attendance row on `targetDate` AND that row's status is
+    // ABSENT". Prisma compiles `some` to a SQL `EXISTS` so the
+    // composite (date, status) index covers the lookup — no
+    // full table scan. We intentionally don't gate this on
+    // `batches.some` first, because the `@@unique([studentId,
+    // date])` index already guarantees at most one row per
+    // (student, date), and the cron only writes ABSENT rows for
+    // students actually enrolled in a slot for that day.
     andConditions.push({
-      NOT: {
-        attendance: { some: { date: targetDate } },
+      attendance: {
+        some: { date: targetDate, status: 'ABSENT' },
       },
     });
   }

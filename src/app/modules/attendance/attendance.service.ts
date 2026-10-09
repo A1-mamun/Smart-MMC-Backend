@@ -1,6 +1,6 @@
 import httpStatus from 'http-status';
 import dayjs from 'dayjs';
-import { Prisma } from '@prisma/client';
+import { Prisma, AttendanceMethod } from '@prisma/client';
 import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
 import AppError from '../../errors/AppError';
@@ -13,12 +13,12 @@ import {
 import calculatePagination from '../../utils/calculatePagination';
 import { clearAttendanceCache } from '../../utils/clearCache';
 import {
-  resolveAttendanceDate,
-  TClassDayBatchDay,
+  resolveTodayAgainstStudentBatches,
   TClassDayStudentBatch,
-  TSwapResolution,
   parseTimeOfDay,
-  weekdayNameFor,
+  weekdayNameForInstitute,
+  getInstituteToday,
+  instituteLocalDate,
 } from '../../utils/classDayCalendar';
 
 const studentDisplayInclude = {
@@ -33,91 +33,43 @@ const studentDisplayInclude = {
   },
 };
 
-const getTodayDate = () => dayjs().startOf('day').toDate();
-
 /**
- * Resolve the date the attendance row should be stamped with by
- * iterating the student's enrolled courses in order and picking the
- * first course whose swap-resolver yields a `normal` or `swap` outcome.
+ * Fetch the BatchDay row for the slot the student is enrolled in
+ * for `today`. Used by the check-in path to read the per-slot admin
+ * toggles (slotStates[i], manualWindowOverride[i]) that gate whether
+ * the kiosk accepts scans for this slot right now.
  *
- * Returns the resolution PLUS the course id that won, so the activity
- * log can record which course was used. When every course rejects, we
- * return the "strongest" rejection — preferring a `swap`/`normal`
- * missing-course message over `no_peer_batch`, which would otherwise
- * mask a legitimate "no class today" / "can't make up 2 days" failure.
+ * Returns `null` if no BatchDay row matches — caller falls through
+ * to "no slot" semantics.
  */
-const resolveAgainstCourses = async (params: {
-  scanDate: Date;
-  studentBatches: TClassDayStudentBatch[];
-  // The student's currently-enrolled course ids. Order matters — we
-  // pick the first one whose resolver returns a real result.
-  courseIds: string[];
-}): Promise<TSwapResolution & { winningCourseId?: string }> => {
-  const { scanDate, studentBatches, courseIds } = params;
-  if (courseIds.length === 0 || studentBatches.length === 0) {
-    return { kind: 'no_peer_batch' };
-  }
-  // Fetch every course's BatchDay rows in one round-trip so we don't
-  // hit the DB N times for an N-course student. BatchDay rows are
-  // hard-deleted (no soft-delete column) so we just filter by course.
-  const courseBatchDays = await prisma.batchDay.findMany({
-    where: { courseId: { in: courseIds } },
-    select: { id: true, courseId: true, days: true },
+const fetchBatchDayForStudent = async (studentId: string, weekday: string) => {
+  // Find the student's active StudentBatch rows for the day, then
+  // pull the BatchDay rows they reference. We only need the rows
+  // that include `weekday` in their `days[]`.
+  const studentBatches = await prisma.studentBatch.findMany({
+    where: { studentId, isDeleted: false },
+    select: {
+      batchDayId: true,
+      batchTime: true,
+      batchDayRel: {
+        select: {
+          id: true,
+          courseId: true,
+          days: true,
+          slotStates: true,
+          manualWindowOverride: true,
+          times: true,
+        },
+      },
+    },
   });
-  // Bucket student batches by courseId so we can pair them with the
-  // matching course's BatchDay union. Students may have multiple
-  // StudentBatch rows in the same course (rare — different times).
-  // `batchDayId` is the join to the course's BatchDay rows.
-  const batchDayIdToCourse = new Map<string, string>();
-  for (const bd of courseBatchDays) batchDayIdToCourse.set(bd.id, bd.courseId);
-  const studentBatchesByCourse = new Map<string, TClassDayStudentBatch[]>();
-  for (const sb of studentBatches) {
-    if (!sb.batchDayId) continue;
-    const courseId = batchDayIdToCourse.get(sb.batchDayId);
-    if (!courseId) continue;
-    const list = studentBatchesByCourse.get(courseId) || [];
-    list.push(sb);
-    studentBatchesByCourse.set(courseId, list);
-  }
-  // Bucket the course's BatchDay rows.
-  const courseBatchDaysByCourse = new Map<string, TClassDayBatchDay[]>();
-  for (const bd of courseBatchDays) {
-    const list = courseBatchDaysByCourse.get(bd.courseId) || [];
-    list.push({ id: bd.id, days: bd.days });
-    courseBatchDaysByCourse.set(bd.courseId, list);
-  }
-
-  // Try each course in the order they were given. First one that
-  // returns normal/swap wins. Rejections are remembered in case every
-  // course rejects — we surface the most informative one.
-  let bestRejection: TSwapResolution = { kind: 'no_peer_batch' };
-  // `normal`/`swap` short-circuit above so we never index them, but TS
-  // insists the Record cover every union member. Assign them -1 so
-  // they never win over a real rejection.
-  const rejectionPriority: Record<TSwapResolution['kind'], number> = {
-    normal: -1,
-    swap: -1,
-    no_class_today: 4,
-    not_eligible: 3,
-    no_peer_batch: 2,
-  };
-  for (const courseId of courseIds) {
-    const sb = studentBatchesByCourse.get(courseId) || [];
-    const bd = courseBatchDaysByCourse.get(courseId) || [];
-    if (sb.length === 0 || bd.length === 0) continue;
-    const result = resolveAttendanceDate({
-      scanDate,
-      studentBatches: sb,
-      courseBatchDays: bd,
-    });
-    if (result.kind === 'normal' || result.kind === 'swap') {
-      return { ...result, winningCourseId: courseId };
-    }
-    if (rejectionPriority[result.kind] > rejectionPriority[bestRejection.kind]) {
-      bestRejection = result;
-    }
-  }
-  return bestRejection;
+  // Find a row whose BatchDay.days includes today AND whose batchDayRel
+  // exists. A student enrolled in a deleted BatchDay is ignored.
+  const matched = studentBatches.find((b) => {
+    if (!b.batchDayRel) return false;
+    return b.batchDayRel.days.some((d) => d.toLowerCase() === weekday.toLowerCase());
+  });
+  return matched?.batchDayRel ?? null;
 };
 
 const checkInStudentToDB = async (payload: TCheckIn) => {
@@ -134,12 +86,50 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
   // dropped along with the rest of the User refactor — the
   // per-enrollment `studentCourseId` is the surviving printable
   // handle, scoped per enrollment.
-  // console.log(`Check-in attempt: ${payload.studentId} (device ${payload.deviceId})`);
   const input = payload.studentId.trim();
 
   // Step 1: try by mobile.
-  let user = await prisma.user.findUnique({
-    where: { mobile: input },
+  // let user = await prisma.user.findUnique({
+  //   where: { mobile: input },
+  //   include: {
+  //     student: {
+  //       include: {
+  //         studentCourses: {
+  //           where: { isDeleted: false },
+  //           include: { course: true, payments: { where: { isDeleted: false } } },
+  //         },
+  //         // `batches` drives the today-resolver. Soft-deleted rows
+  //         // are filtered out so legacy data doesn't pollute the
+  //         // dedicated-day set.
+  //         batches: {
+  //           where: { isDeleted: false },
+  //           include: { batchDayRel: true },
+  //         },
+  //       },
+  //     },
+  //   },
+  // });
+
+  // Step 2: fall back to the printed handle on the ID card.
+  // if (!user) {
+  const enrollment = await prisma.studentCourse.findFirst({
+    where: { studentCourseId: input, isDeleted: false },
+    select: { studentId: true },
+  });
+
+  if (!enrollment) {
+    throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
+  }
+
+  const user = await prisma.user.findUnique({
+    where: {
+      id: (
+        await prisma.student.findUnique({
+          where: { id: enrollment.studentId },
+          select: { userId: true },
+        })
+      )?.userId,
+    },
     include: {
       student: {
         include: {
@@ -147,11 +137,6 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
             where: { isDeleted: false },
             include: { course: true, payments: { where: { isDeleted: false } } },
           },
-          // `batches` powers the swap resolver. We need every active
-          // row for this student across all their courses so the
-          // helper can build the union of class days. Soft-deleted
-          // rows are filtered out so legacy data doesn't pollute the
-          // union.
           batches: {
             where: { isDeleted: false },
             include: { batchDayRel: true },
@@ -160,40 +145,8 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
       },
     },
   });
-
-  // Step 2: fall back to the printed handle on the ID card.
-  if (!user) {
-    const enrollment = await prisma.studentCourse.findFirst({
-      where: { studentCourseId: input, isDeleted: false },
-      select: { studentId: true },
-    });
-    if (enrollment) {
-      user = await prisma.user.findUnique({
-        where: {
-          id: (
-            await prisma.student.findUnique({
-              where: { id: enrollment.studentId },
-              select: { userId: true },
-            })
-          )?.userId,
-        },
-        include: {
-          student: {
-            include: {
-              studentCourses: {
-                where: { isDeleted: false },
-                include: { course: true, payments: { where: { isDeleted: false } } },
-              },
-              batches: {
-                where: { isDeleted: false },
-                include: { batchDayRel: true },
-              },
-            },
-          },
-        },
-      });
-    }
-  }
+  //   }
+  // }
 
   if (!user || user.isDeleted || !user.student) {
     throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
@@ -203,30 +156,22 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
   }
 
   const student = user.student;
-  const today = getTodayDate();
+  const today = getInstituteToday();
+  const todayWeekday = weekdayNameForInstitute(today);
 
-  // Resolve the actual date the Attendance row should be stamped with
-  // (may equal today for a normal check-in, or a different day for a
-  // peer-batch make-up). Throws 400 with a user-facing message when
-  // the swap is not allowed.
-  const resolution = await resolveAgainstCourses({
-    scanDate: today,
-    studentBatches: student.batches as unknown as TClassDayStudentBatch[],
-    courseIds: student.studentCourses.map((sc) => sc.courseId),
-  });
+  // Resolve whether today is a dedicated class day for this
+  // student. Make-up attendance is no longer supported — a scan on
+  // a day the student isn't enrolled in is rejected with a 400.
+  const resolution = resolveTodayAgainstStudentBatches(
+    student.batches as unknown as TClassDayStudentBatch[],
+  );
   if (resolution.kind === 'no_class_today') {
-    throw new AppError(httpStatus.BAD_REQUEST, 'No class scheduled in your course today');
+    throw new AppError(httpStatus.BAD_REQUEST, 'No class scheduled for your batch today');
   }
-  if (resolution.kind === 'not_eligible') {
+  if (resolution.kind === 'no_enrollment') {
     throw new AppError(
       httpStatus.BAD_REQUEST,
-      'Cannot make up a class from 2+ days ago. Check your batch schedule.',
-    );
-  }
-  if (resolution.kind === 'no_peer_batch') {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      'Your batch has no peer batch for make-up. Please attend your scheduled class day.',
+      'Student has no active enrollment. Please contact admin.',
     );
   }
 
@@ -239,13 +184,6 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
    * doesn't accept attendance for a class that hasn't started yet
    * or that ended more than 5 minutes ago.
    *
-   * The rule applies symmetrically to `normal` (the scan day IS
-   * the class day) and `swap` (the scan day is a peer batch and
-   * the row is recorded for the dedicated day). In both cases
-   * `startsAtMinutes` is the wall-clock start of the resolved
-   * class — the only thing that matters is "is `now_minutes`
-   * within `[start, start + 5]`?".
-   *
    * Admin-driven manual check-ins bypass this gate (the manual
    * endpoint doesn't call into this helper — see
    * `manualCheckInToDB`). The kiosk is the only caller that
@@ -253,32 +191,29 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
    * means even a hand-typed scan in the kiosk UI can't bypass it.
    */
   /*
-   * Resolve the matched BatchDay + slot index ONCE so both the
-   * admit guard (slotStates[i] === false) and the window guard
-   * (manualWindowOverride[i] === true) below can read the
-   * same row. Hoisted to the top of this block because both
-   * guards need it.
+   * Resolve the matched BatchDay ONCE so both the admit guard
+   * (slotStates[i] === false) and the window guard
+   * (manualWindowOverride[i] === true) below can read the same
+   * row. Hoisted to the top of this block because both guards
+   * need it.
    */
-  const matchedSlot = await (async (): Promise<{
-    manualOpen: boolean;
-    slotOn: boolean;
-  }> => {
-    if (!resolution.winningCourseId) return { manualOpen: false, slotOn: false };
-    const winningBatch = student.batches.find(
-      (b) => b.batchDayRel?.courseId === resolution.winningCourseId,
-    );
-    if (!winningBatch?.batchDayId) return { manualOpen: false, slotOn: false };
-    const winningBatchDay = await prisma.batchDay.findUnique({
-      where: { id: winningBatch.batchDayId },
-      select: { slotStates: true, manualWindowOverride: true, times: true },
-    });
-    if (!winningBatchDay) return { manualOpen: false, slotOn: false };
-    const idx = winningBatchDay.times.indexOf(winningBatch.batchTime);
-    return {
-      manualOpen: idx >= 0 ? winningBatchDay.manualWindowOverride?.[idx] === true : false,
-      slotOn: idx >= 0 ? winningBatchDay.slotStates?.[idx] === true : false,
-    };
-  })();
+  const matchedBatchDay = await fetchBatchDayForStudent(student.id, todayWeekday);
+  let slotOn = false;
+  let manualOpen = false;
+  let matchedSlotIdx = -1;
+  if (matchedBatchDay) {
+    // Pick the slot index by matching the student's own batchTime
+    // against BatchDay.times[]. If the BatchDay has only one slot
+    // (legacy), it always matches index 0.
+    const studentSlotTime = (student.batches || []).find(
+      (b) => b.batchDayRel?.id === matchedBatchDay.id,
+    )?.batchTime;
+    matchedSlotIdx = studentSlotTime ? matchedBatchDay.times.indexOf(studentSlotTime) : 0;
+    if (matchedSlotIdx >= 0) {
+      slotOn = matchedBatchDay.slotStates?.[matchedSlotIdx] === true;
+      manualOpen = matchedBatchDay.manualWindowOverride?.[matchedSlotIdx] === true;
+    }
+  }
 
   /*
    * Per-slot admit flag (slotStates[i] === false → kiosk locked
@@ -288,7 +223,7 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
    * window so the kiosk also gets disabled if the admin turns
    * attendance OFF mid-class.
    */
-  if (matchedSlot.slotOn === false) {
+  if (slotOn === false) {
     throw new AppError(
       httpStatus.BAD_REQUEST,
       "Taking attendance is currently disabled for this slot. Ask the admin to turn on attendance for this batch's time slot.",
@@ -311,7 +246,7 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
    * a disabled slot stays locked out regardless of any
    * stale override.
    */
-  if (!matchedSlot.manualOpen) {
+  if (!manualOpen) {
     if (nowMin < earliest) {
       throw new AppError(
         httpStatus.BAD_REQUEST,
@@ -325,11 +260,10 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
       );
     }
   }
-  // We don't need slotOverrideOpen / overrideOn because
-  // winningBatchDay is in scope. Use it directly.
 
-  const recordedDate = resolution.date;
-  const swapFromDate = resolution.kind === 'swap' ? resolution.swapFromDate : null;
+  // Shaped for Prisma @db.Date: UTC-midnight Date whose UTC date
+  // parts equal the BD-local YYYY-MM-DD.
+  const recordedDate = instituteLocalDate(today);
 
   let attendance = await prisma.attendance.findUnique({
     where: {
@@ -344,36 +278,16 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
         studentId: student.id,
         date: recordedDate,
         method: 'NFC',
+        // `status` is PRESENT for a fresh check-in. The cron writes
+        // ABSENT for students who never scanned; this path can't
+        // produce ABSENT because we just verified the student scanned
+        // during their enrolled slot.
+        status: 'PRESENT',
         deviceId: payload.deviceId,
-        // Nullable column — only set when the resolver returned a
-        // swap. The unique constraint on (studentId, date) means a
-        // student still gets exactly one row per dedicated class day.
-        swapFromDate,
       },
     });
-    isFirstCheckIn = true;
 
-    // Audit trail for the swap. Device-triggered checks have no admin
-    // actor, so we pass nulls — both fields are nullable in the schema
-    // and the activity-log UI already renders null actors as "System".
-    if (swapFromDate) {
-      await prisma.activityLog.create({
-        data: {
-          actorId: null,
-          actorRole: null,
-          action: 'ATTENDANCE_SWAPPED',
-          entityType: 'Attendance',
-          entityId: attendance.id,
-          description: `Make-up attendance: scanned ${weekdayNameFor(today)} → recorded for ${weekdayNameFor(recordedDate)}`,
-          metadata: {
-            scanDate: today,
-            recordedDate,
-            courseId: resolution.winningCourseId ?? null,
-            deviceId: payload.deviceId ?? null,
-          },
-        },
-      });
-    }
+    isFirstCheckIn = true;
   }
 
   const dueAmount = student.studentCourses.reduce((sum, e) => {
@@ -396,17 +310,13 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
     },
     attendanceId: attendance.id,
     date: attendance.date,
-    swapFromDate: attendance.swapFromDate ?? null,
     checkInAt: attendance.checkInAt,
     method: attendance.method,
+    status: attendance.status,
     isFirstCheckIn,
     courseNames,
     dueAmount,
-    message: isFirstCheckIn
-      ? attendance.swapFromDate
-        ? `Make-up recorded for ${dayjs(recordedDate).format('ddd, MMM D')} (scanned ${weekdayNameFor(today)})`
-        : `Welcome, ${user.name}!`
-      : `${user.name} already checked in.`,
+    message: isFirstCheckIn ? `Welcome, ${user.name}!` : `${user.name} already checked in.`,
   };
 };
 
@@ -428,43 +338,34 @@ const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
 
   if (!student) throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
 
-  // Resolve the recorded date. Manual check-ins fall into two cases:
+  // Manual check-ins fall into two cases:
   //   1. Admin passes an explicit `payload.date` → record for that
   //      date verbatim. The admin is asserting a specific day, so we
-  //      bypass the swap resolver entirely (lets them back-date
+  //      skip the today-resolver entirely (lets them back-fill
   //      historical attendance).
   //   2. Admin omits `payload.date` → behave like a barcode scan for
-  //      "today". Apply the same swap resolver so a manual entry
-  //      from the admin panel honours the make-up rule too.
-  const scanDate = getTodayDate();
-  let targetDate = payload.date ? dayjs(payload.date).startOf('day').toDate() : scanDate;
-  let swapFromDate: Date | null = null;
-
-  if (!payload.date) {
-    const resolution = await resolveAgainstCourses({
-      scanDate,
-      studentBatches: student.batches as unknown as TClassDayStudentBatch[],
-      courseIds: student.studentCourses.map((sc) => sc.courseId),
-    });
+  //      "today". Apply the today-resolver so a manual entry on a
+  //      non-enrolled day is rejected with the same 400 as the kiosk.
+  let targetDate: Date;
+  if (payload.date) {
+    // Anchor to BD-local calendar day using `instituteLocalDate` so
+    // the UTC date parts equal the admin's intended YYYY-MM-DD
+    // (otherwise we'd be off by ±1 day around the BD midnight boundary).
+    targetDate = instituteLocalDate(payload.date);
+  } else {
+    const resolution = resolveTodayAgainstStudentBatches(
+      student.batches as unknown as TClassDayStudentBatch[],
+    );
     if (resolution.kind === 'no_class_today') {
-      throw new AppError(httpStatus.BAD_REQUEST, 'No class scheduled in their course today');
+      throw new AppError(httpStatus.BAD_REQUEST, 'No class scheduled for their batch today');
     }
-    if (resolution.kind === 'not_eligible') {
+    if (resolution.kind === 'no_enrollment') {
       throw new AppError(
         httpStatus.BAD_REQUEST,
-        'Cannot make up a class from 2+ days ago. Check their batch schedule.',
+        'Student has no active enrollment. Please contact admin.',
       );
     }
-    if (resolution.kind === 'no_peer_batch') {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        'Their batch has no peer batch for make-up. Mark attendance for the scheduled class day directly.',
-      );
-    }
-    if (resolution.kind === 'swap') {
-      targetDate = resolution.date;
-      swapFromDate = resolution.swapFromDate;
-    }
+    targetDate = instituteLocalDate(getInstituteToday());
   }
 
   let attendance = await prisma.attendance.findUnique({
@@ -478,8 +379,10 @@ const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
         studentId: student.id,
         date: targetDate,
         method: 'MANUAL',
+        // Same as the NFC path: a manual entry is always PRESENT.
+        // The cron inserts ABSENT for students who never scanned.
+        status: 'PRESENT',
         recordedBy: user.userId,
-        swapFromDate,
       },
     });
     isFirstCheckIn = true;
@@ -488,16 +391,13 @@ const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
       data: {
         actorId: user.userId,
         actorRole: user.role as 'SUPER_ADMIN' | 'ADMIN',
-        action: swapFromDate ? 'ATTENDANCE_SWAPPED' : 'ATTENDANCE_MARKED',
+        action: 'ATTENDANCE_MARKED',
         entityType: 'Attendance',
         entityId: attendance.id,
-        description: swapFromDate
-          ? `Manual make-up: scanned ${weekdayNameFor(scanDate)} → recorded for ${weekdayNameFor(targetDate)}`
-          : `Manual attendance for "${student.user.name}"`,
+        description: `Manual attendance for "${student.user.name}"`,
         metadata: {
           studentId: student.id,
           date: targetDate,
-          scanDate: swapFromDate ? scanDate : undefined,
           courseId: student.studentCourses[0]?.courseId ?? null,
         },
       },
@@ -508,57 +408,73 @@ const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
 
   return {
     student: {
-      // Mobile replaces the dropped `User.studentId` as the per-account
-      // identifier on the User object. The receipt / display layer
-      // joins on StudentCourse.studentCourseId when it needs the
-      // per-enrollment handle.
       mobile: student.user.mobile,
       name: student.user.name,
       nickname: student.user.nickname,
     },
     attendanceId: attendance.id,
     date: attendance.date,
-    swapFromDate: attendance.swapFromDate ?? null,
     checkInAt: attendance.checkInAt,
+    status: attendance.status,
     method: attendance.method,
     isFirstCheckIn,
     courseNames: student.studentCourses.map((e) => e.course.name),
     message: isFirstCheckIn
-      ? attendance.swapFromDate
-        ? `Make-up recorded for ${dayjs(targetDate).format('ddd, MMM D')} (scanned ${weekdayNameFor(scanDate)}).`
-        : `Attendance marked for ${student.user.name}.`
-      : `${student.user.name} was already marked on ${dayjs(targetDate).format('YYYY-MM-DD')}.`,
+      ? `Attendance marked for ${student.user.name}.`
+      : `${student.user.name} was already marked on ${dayjs.utc(targetDate).tz('Asia/Dhaka').format('YYYY-MM-DD')}.`,
   };
 };
 
 const getTodayAttendanceFromDB = async (filters: TGetToday) => {
   const { page, limit, skip } = calculatePagination(filters);
-  const today = getTodayDate();
+  // Shape for Prisma @db.Date — UTC-midnight Date whose UTC date
+  // parts equal the BD-local today. `getInstituteToday()` returns
+  // BD-midnight absolute time (T18:00Z on BD Oct 8), which would
+  // round-trip to the previous day in the @db.Date column.
+  const today = instituteLocalDate(new Date());
 
-  const where: Prisma.AttendanceWhereInput = {
-    date: today,
-    student: { isDeleted: false },
-  };
-
+  /*
+   * Build a single `AND` list of student-level predicates so each
+   * filter (course, HSC batch, batch day, batch time) composes
+   * cleanly. Prisma's relation `some` lets us stack them inside
+   * one `student` clause without overwriting each other — the
+   * earlier `where.student = { ... }` rewrites made
+   * combination filters (e.g. course + batch day) drop one
+   * filter on the floor.
+   */
+  const studentAndClauses: Prisma.StudentWhereInput[] = [{ isDeleted: false }];
+  if (filters.courseId) {
+    studentAndClauses.push({
+      studentCourses: {
+        some: { courseId: filters.courseId, isDeleted: false },
+      },
+    });
+  }
   if (filters.hscBatch) {
-    where.student = {
-      isDeleted: false,
+    studentAndClauses.push({
       batches: {
         some: {
           hscBatch: filters.hscBatch as 'BATCH_25' | 'BATCH_26' | 'BATCH_27' | 'BATCH_28',
           isDeleted: false,
         },
       },
-    };
+    });
   }
-  if (filters.batchDay || filters.batchTime) {
-    const batchWhere: Prisma.StudentBatchWhereInput = { isDeleted: false };
-    if (filters.batchDay)
-      batchWhere.batchDay = filters.batchDay as
-        'SAT' | 'SUN' | 'MON' | 'TUE' | 'WED' | 'THU' | 'FRI';
-    if (filters.batchTime) batchWhere.batchTime = filters.batchTime as 'TIME_7AM' | 'TIME_4PM';
-    where.student = { ...(where.student as object), batches: { some: batchWhere } };
+  if (filters.batchTime) {
+    studentAndClauses.push({
+      batches: {
+        some: {
+          isDeleted: false,
+          batchTime: filters.batchTime as 'TIME_7AM' | 'TIME_4PM',
+        },
+      },
+    });
   }
+
+  const where: Prisma.AttendanceWhereInput = {
+    date: today,
+    student: { AND: studentAndClauses },
+  };
 
   const [data, total] = await Promise.all([
     prisma.attendance.findMany({
@@ -579,9 +495,12 @@ const getStudentAttendanceFromDB = async (params: TGetStudentAttendance) => {
   const { page, limit, skip, sortBy, sortOrder } = calculatePagination(params.query);
   const where: Prisma.AttendanceWhereInput = { studentId };
   if (params.query.startDate || params.query.endDate) {
+    // Re-shape to BD-anchored UTC midnight so the @db.Date filter
+    // compares BD calendar days, not whatever UTC date parts the
+    // query string happened to encode.
     where.date = {
-      ...(params.query.startDate ? { gte: params.query.startDate } : {}),
-      ...(params.query.endDate ? { lte: params.query.endDate } : {}),
+      ...(params.query.startDate ? { gte: instituteLocalDate(params.query.startDate) } : {}),
+      ...(params.query.endDate ? { lte: instituteLocalDate(params.query.endDate) } : {}),
     };
   }
 
@@ -607,19 +526,39 @@ const getStudentAttendanceFromDB = async (params: TGetStudentAttendance) => {
 const getAttendanceStatsFromDB = async () => {
   const startOfMonth = dayjs().startOf('month').toDate();
   const endOfMonth = dayjs().endOf('month').toDate();
+  const todayLocal = instituteLocalDate(new Date());
 
-  const [monthlyPresent, totalStudents, todayPresent] = await Promise.all([
+  // Aggregate per-status counts in one round-trip. The (date, status)
+  // composite index on Attendance makes this O(matched rows) rather
+  // than a full-table scan even on a large attendance history.
+  const [monthlyPresent, totalStudents, todayStatusGroups] = await Promise.all([
     prisma.attendance.count({
       where: { date: { gte: startOfMonth, lte: endOfMonth } },
     }),
     prisma.student.count({ where: { isDeleted: false } }),
-    prisma.attendance.count({ where: { date: getTodayDate() } }),
+    prisma.attendance.groupBy({
+      by: ['status'],
+      where: { date: todayLocal },
+      _count: { _all: true },
+    }),
   ]);
+
+  const todayByStatus = todayStatusGroups.reduce<Record<string, number>>((acc, g) => {
+    acc[g.status] = g._count._all;
+    return acc;
+  }, {});
+  const todayPresent = todayByStatus.PRESENT ?? 0;
+  const todayAbsent = todayByStatus.ABSENT ?? 0;
 
   return {
     monthlyPresent,
     totalActiveStudents: totalStudents,
     todayPresent,
+    todayAbsent,
+    todayByStatus: {
+      PRESENT: todayByStatus.PRESENT ?? 0,
+      ABSENT: todayByStatus.ABSENT ?? 0,
+    },
   };
 };
 
@@ -627,6 +566,12 @@ const deleteAttendanceFromDB = async (id: string, user: JwtPayload) => {
   const existing = await prisma.attendance.findUnique({ where: { id } });
   if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Attendance record not found');
 
+  // NOTE: deleting an ABSENT row does NOT cause the cron's next
+  // tick to re-insert it — slots only fire ONCE at finish time.
+  // If the admin wants to swap an ABSENT row for a PRESENT row
+  // (e.g. the student DID attend but the scan failed), they should
+  // use the manual check-in path, which will reuse the same
+  // (studentId, date) slot via the unique index.
   await prisma.attendance.delete({ where: { id } });
   await prisma.activityLog.create({
     data: {
@@ -645,10 +590,7 @@ const deleteAttendanceFromDB = async (id: string, user: JwtPayload) => {
 /**
  * Render a minutes-since-midnight integer as "h:mm AM/PM" so we can
  * echo the kiosk's check-in-window boundaries back to the operator
- * ("opens at 4:00 PM", "closed at 4:05 PM"). Mirrors `parseTimeOfDay`
- * (now centralised in `classDayCalendar.ts`) but in the opposite
- * direction — kept local because it's only needed by the kiosk
- * error messages above.
+ * ("opens at 4:00 PM", "closed at 4:05 PM").
  */
 const minutesToClock = (minutes: number): string => {
   const hour24 = Math.floor(minutes / 60);
@@ -719,8 +661,8 @@ export type TCurrentBatch =
  * for the kiosk / automatic-attendance view. We pull every active
  * `BatchDay` whose `days[]` includes today's weekday, then for each
  * `time` slot we compare the current wall-clock minute against the
- * parsed slot. The "current" rule is a 60-min window starting at
- * the slot start (matches a 1-hour class). If nothing is current we
+ * parsed slot. The "current" rule is a 60-min window starting at the
+ * slot start (matches a 1-hour class). If nothing is current we
  * return the next upcoming slot (sorted by start time) so the kiosk
  * can pre-announce. If nothing is scheduled today at all we return
  * `{ kind: 'none' }`.
@@ -730,9 +672,13 @@ export type TCurrentBatch =
  * total this is < 1ms of server work, so caching is unnecessary.
  */
 const getCurrentBatchFromDB = async (): Promise<TCurrentBatch> => {
-  const now = new Date();
-  const todayMinutes = now.getHours() * 60 + now.getMinutes();
-  const todayName = weekdayNameFor(now);
+  // "now" is anchored to Asia/Dhaka wall-clock time-of-day so the
+  // batch schedule (which is configured in BD local time) lines up
+  // with what the kiosk clock shows, regardless of where the server
+  // is hosted.
+  const now = dayjs().tz('Asia/Dhaka');
+  const todayMinutes = now.hour() * 60 + now.minute();
+  const todayName = weekdayNameForInstitute(now.toDate());
 
   // Pull every BatchDay for active, non-deleted courses whose days[]
   // include today. We over-fetch slightly (one query for current +
@@ -744,7 +690,10 @@ const getCurrentBatchFromDB = async (): Promise<TCurrentBatch> => {
   // 60-min default or a custom 75-min class).
   const allDays = await prisma.batchDay.findMany({
     where: {
-      course: { isActive: true, isDeleted: false },
+      // COMPLETE courses are "inactive" by lifecycle — the
+      // kiosk should never surface a slot from a course that's
+      // been marked graduated.
+      course: { isDeleted: false, status: { not: 'COMPLETE' } },
     },
     select: {
       id: true,
@@ -783,18 +732,19 @@ const getCurrentBatchFromDB = async (): Promise<TCurrentBatch> => {
     durationMinutes: number;
     // Per-slot "barcode scan allowed right now" flag. The
     // admin toggles this manually — the kiosk treats `true`
-    // as "admit scans" and `false` as "reject scans". The
-    // cross-course "only one ON" invariant is enforced at
-    // write time by `toggleBatchSlotToDB`, so at any given
-    // time AT MOST ONE slot in the database is true.
+    // as "admit scans" and `false` as "reject scans". Slot
+    // states are per-slot and independent; multiple slots
+    // can be ON at the same time, but the kiosk only
+    // surfaces the slot whose wall-clock window is currently
+    // open so the operator never sees a conflict.
     slotEnabled: boolean;
     // Per-slot "check-in window override". When the i-th
     // element is `true`, the kiosk accepts scans for that
     // slot regardless of the wall clock (admin opened the
     // window early for an early arrival, or kept it open
-    // past the 5-min mark). When `false` (or absent), the
-    // kiosk uses the default 5-minute window centred on
-    // the slot start time.
+    // past the 5-minute mark). When `false` (or absent), the
+    // kiosk uses the default 5-minute window centred on the
+    // slot start time.
     manualWindowOpen: boolean;
   };
   const slots: Slot[] = [];
@@ -891,6 +841,159 @@ const getCurrentBatchFromDB = async (): Promise<TCurrentBatch> => {
   };
 };
 
+/**
+ * Mark ABSENT any student enrolled in a class that just finished and
+ * who did not check in. Called by the per-minute cron in
+ * `settings/scheduler.ts`.
+ *
+ * Algorithm:
+ *   1. Compute the BD-local "today" (calendar day) and the BD-local
+ *      "now" wall-clock time (minutes-since-midnight).
+ *   2. Pull every BatchDay row that has the current BD-local weekday
+ *      in its `days[]` and belongs to an active, non-deleted course.
+ *   3. For each row, walk its `times[]` slots and find any whose
+ *      [start_minutes + durationMinutes] fell within the previous
+ *      minute (so a class ending at 16:05:00 fires on the 16:05:30
+ *      tick — small slack window so we don't miss a tick that
+ *      happened to land on the boundary).
+ *   4. For each finished slot, find the students enrolled in that
+ *      exact (batchDayId, batchTime) slot (i.e. StudentBatch rows
+ *      where `isDeleted = false`).
+ *   5. Filter to students whose (studentId, BD-today) tuple has NO
+ *      existing Attendance row — covers both real check-ins (PRESENT)
+ *      and admin manual entries (also PRESENT).
+ *   6. Insert ABSENT rows in bulk with `skipDuplicates: true` so a
+ *      concurrent tick (or a re-run after a crash) can't produce two
+ *      rows for the same (studentId, date) — the unique index
+ *      enforces it at the DB layer too.
+ *
+ * Returns a small summary so the scheduler can log diagnostics.
+ *
+ * Idempotency is two-layered:
+ *   - In-process: the caller (scheduler) holds a fire-key latch on
+ *     `(courseId, slotIndex, BD-date)` so the same slot isn't
+ *     re-processed within the same process lifetime. The latch is
+ *     deliberately NOT persisted — on process restart the cron
+ *     resumes from the next minute slot, and a slot that fired in
+ *     a previous lifetime has already had its ABSENT rows written
+ *     (and the unique constraint would reject any duplicate).
+ *   - At the DB: `@@unique([studentId, date])` plus
+ *     `createMany({ skipDuplicates: true })` makes the operation
+ *     idempotent even if a slow tick overlaps a fast restart.
+ */
+const markAbsenteesForFinishedSlotsToDB = async (): Promise<{
+  scanned: number;
+  inserted: number;
+  slots: number;
+}> => {
+  const nowBd = dayjs().tz('Asia/Dhaka');
+  const todayLocal = new Date(Date.UTC(nowBd.year(), nowBd.month(), nowBd.date()));
+  const nowMinutes = nowBd.hour() * 60 + nowBd.minute();
+  const todayName = weekdayNameForInstitute(nowBd.toDate());
+
+  // Pre-window: how far back to look for "just finished" slots. A
+  // 60-second window covers the previous minute cleanly even when
+  // the cron tick lands a few seconds past the boundary. A wider
+  // window (e.g. 5 minutes) would re-process slots that already
+  // fired; narrower would risk missing boundary cases.
+  const PRE_WINDOW_MIN = 1;
+
+  const batcDays = await prisma.batchDay.findMany({
+    where: {
+      days: { has: todayName },
+      // COMPLETE courses are "inactive" by lifecycle — the
+      // absent-marking cron should never stamp rows for a
+      // course that's already graduated.
+      course: { isDeleted: false, status: { not: 'COMPLETE' } },
+    },
+    select: {
+      id: true,
+      courseId: true,
+      course: { select: { name: true } },
+      times: true,
+      durationMinutes: true,
+    },
+  });
+
+  let totalInserted = 0;
+  let totalScanned = 0;
+  let slotsProcessed = 0;
+
+  for (const bd of batcDays) {
+    for (let slotIdx = 0; slotIdx < bd.times.length; slotIdx++) {
+      const slotTime = bd.times[slotIdx];
+      const startMin = parseTimeOfDay(slotTime);
+      if (startMin === null) continue;
+      const endMin = startMin + bd.durationMinutes;
+
+      // Slot finishes when its end crosses the now mark. The window
+      // catches slots whose end is between (nowMinutes - 1) and
+      // (nowMinutes + small epsilon). We use strict "<= nowMin" AND
+      // "> nowMin - 1" so a slot ending at exactly nowMin fires
+      // once — the upper bound is inclusive of the current minute,
+      // the lower bound excludes anything the previous minute already
+      // handled.
+      if (endMin > nowMinutes) continue;
+      if (endMin < nowMinutes - PRE_WINDOW_MIN) continue;
+      slotsProcessed += 1;
+
+      // Students enrolled in this exact (batchDayId, batchTime).
+      // Multiple students can map to the same slot — the createMany
+      // bulk-insert keeps the round-trip count O(slots) instead of
+      // O(students).
+      const enrolled = await prisma.studentBatch.findMany({
+        where: {
+          batchDayId: bd.id,
+          batchTime: slotTime,
+          isDeleted: false,
+          student: { isDeleted: false },
+        },
+        select: { studentId: true },
+      });
+      if (enrolled.length === 0) continue;
+      totalScanned += enrolled.length;
+
+      // Filter to students with no existing Attendance row for
+      // today. Single query — fetch existing rows for these
+      // students on today's BD date, then subtract.
+      const studentIds = enrolled.map((e) => e.studentId);
+      const existing = await prisma.attendance.findMany({
+        where: {
+          studentId: { in: studentIds },
+          date: todayLocal,
+        },
+        select: { studentId: true },
+      });
+      const coveredIds = new Set(existing.map((e) => e.studentId));
+      const absentCandidates = studentIds.filter((id) => !coveredIds.has(id));
+      if (absentCandidates.length === 0) continue;
+
+      // `method: ADMIN` — there's no scanner involved; the row is
+      // system-generated. Keeps the existing AttendanceMethod enum
+      // (NFC/MANUAL/ADMIN) as-is and avoids introducing a new
+      // "SYSTEM" value. `recordedBy` is left null because the
+      // initiator is the SYSTEM cron, not a human actor.
+      // `checkInAt` is the actual end-of-class wall-clock instant
+      // so the audit trail shows when the ABSENT decision was made.
+      const result = await prisma.attendance.createMany({
+        data: absentCandidates.map((studentId) => ({
+          studentId,
+          date: todayLocal,
+          status: 'ABSENT' as const,
+          method: AttendanceMethod.ADMIN,
+          deviceId: null,
+          recordedBy: null,
+          checkInAt: nowBd.toDate(),
+        })),
+        skipDuplicates: true,
+      });
+      totalInserted += result.count;
+    }
+  }
+
+  return { scanned: totalScanned, inserted: totalInserted, slots: slotsProcessed };
+};
+
 export const AttendanceService = {
   checkInStudentToDB,
   manualCheckInToDB,
@@ -899,4 +1002,5 @@ export const AttendanceService = {
   getAttendanceStatsFromDB,
   deleteAttendanceFromDB,
   getCurrentBatchFromDB,
+  markAbsenteesForFinishedSlotsToDB,
 };

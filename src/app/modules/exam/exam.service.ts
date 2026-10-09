@@ -5,6 +5,9 @@ import AppError from '../../errors/AppError';
 import calculatePagination from '../../utils/calculatePagination';
 import { JwtPayload } from 'jsonwebtoken';
 import {
+  instituteLocalDate,
+} from '../../utils/classDayCalendar';
+import {
   TCreateExam,
   TUpdateExam,
   TSetPublish,
@@ -29,7 +32,7 @@ import {
  * *output* type is `boolean`. Without this coercion, `isResultPublished`
  * arrives as `"true"` / `"false"` / `undefined` and the strict equality
  * `isResultPublished === true` would silently never match — the same trap
- * that bit `hasDue` / `activeCoursesOnly` in student.service.ts.
+ * that bit `hasDue` in student.service.ts.
  */
 const isTruthyQuery = (v: unknown): boolean =>
   v === true || v === 'true' || v === '1' || v === 1;
@@ -164,16 +167,20 @@ const createExamToDB = async (payload: TCreateExam, user: JwtPayload) => {
   if (Number.isNaN(examDate.getTime())) {
     throw new AppError(httpStatus.BAD_REQUEST, 'Invalid examDate');
   }
-  // Reject past dates. `examDate` is a @db.Date (no time component), so we
-  // compare on the day boundary using the server's local "today". An exam
-  // scheduled for *today* is still allowed — only strictly earlier days are
-  // blocked, since you can't usefully create an exam that's already
-  // happened.
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const examDay = new Date(examDate);
-  examDay.setHours(0, 0, 0, 0);
-  if (examDay.getTime() < today.getTime()) {
+  // Re-shape the incoming examDate so it's safe to hand to Prisma for a
+  // @db.Date column. The frontend may send a UTC-midnight Date, a
+  // BD-midnight Date, or an ISO string — `instituteLocalDate` produces
+  // a JS Date with UTC date parts equal to the BD-local YYYY-MM-DD,
+  // which is what Prisma's PG driver serialises into the @db.Date
+  // column. Without this re-shape, a frontend-sent BD-midnight Date
+  // (`2026-10-07T18:00:00.000Z`) would round-trip into `2026-10-07`.
+  const examDateLocal = instituteLocalDate(examDate);
+
+  // Reject past dates. Compare on the BD-local calendar day so the
+  // admin can't create an exam "yesterday" BD just because the
+  // server's clock is ahead/behind.
+  const todayLocal = instituteLocalDate(new Date());
+  if (examDateLocal.getTime() < todayLocal.getTime()) {
     throw new AppError(
       httpStatus.BAD_REQUEST,
       'examDate cannot be in the past',
@@ -201,9 +208,15 @@ const createExamToDB = async (payload: TCreateExam, user: JwtPayload) => {
     }
   }
 
-  // 1. Verify course is active and not soft-deleted.
+  // 1. Verify course is not soft-deleted. A COMPLETE course
+  //   is "inactive" by status; we block the same way we
+  //   would have under the old `isActive: true` filter.
   const course = await prisma.course.findFirst({
-    where: { id: payload.courseId, isActive: true, isDeleted: false },
+    where: {
+      id: payload.courseId,
+      isDeleted: false,
+      status: { not: 'COMPLETE' },
+    },
   });
   if (!course) {
     throw new AppError(
@@ -232,7 +245,7 @@ const createExamToDB = async (payload: TCreateExam, user: JwtPayload) => {
       data: {
         title: payload.title.trim(),
         syllabus: payload.syllabus,
-        examDate,
+        examDate: examDateLocal,
         courseId: course.id,
         totalMarks,
         createdById: user.userId,
@@ -362,30 +375,33 @@ const updateExamToDB = async (
     if (payload.title !== undefined) meta.title = payload.title.trim();
     if (payload.syllabus !== undefined) meta.syllabus = payload.syllabus;
     if (examDateUpdate) {
-      // Past-date guard: reject if the new date is strictly before today
-      // AND differs from the existing date. Submitting the existing date
-      // back unchanged is a no-op (e.g. admin is editing the syllabus only
-      // on an exam whose date is already today/past). This mirrors the
-      // create-side guard and keeps the date the same way the user
-      // expects.
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const newDay = new Date(examDateUpdate);
-      newDay.setHours(0, 0, 0, 0);
-      const existingDay = new Date(existing.examDate);
-      existingDay.setHours(0, 0, 0, 0);
-      const isSameDate = newDay.getTime() === existingDay.getTime();
-      if (!isSameDate && newDay.getTime() < today.getTime()) {
+      // Re-shape the incoming + existing dates to be BD-anchored UTC
+      // midnights so the equality check below compares BD calendar
+      // days, not whatever UTC date parts the DB hydration returned.
+      // `existing.examDate` is whatever the previous write produced —
+      // if the previous write was buggy and stored the wrong day, this
+      // code still produces a consistent comparison; the operator would
+      // see the underlying wrong value in the read path until they
+      // back-fill the row manually.
+      const todayLocal = instituteLocalDate(new Date());
+      const newDayLocal = instituteLocalDate(examDateUpdate);
+      const existingDayLocal = instituteLocalDate(existing.examDate);
+      const isSameDate = newDayLocal.getTime() === existingDayLocal.getTime();
+      if (!isSameDate && newDayLocal.getTime() < todayLocal.getTime()) {
         throw new AppError(
           httpStatus.BAD_REQUEST,
           'examDate cannot be in the past',
         );
       }
-      meta.examDate = examDateUpdate;
+      meta.examDate = newDayLocal;
     }
     if (payload.courseId !== undefined) {
       const course = await tx.course.findFirst({
-        where: { id: payload.courseId, isActive: true, isDeleted: false },
+        where: {
+          id: payload.courseId,
+          isDeleted: false,
+          status: { not: 'COMPLETE' },
+        },
       });
       if (!course) {
         throw new AppError(
@@ -1534,17 +1550,11 @@ const getMyUpcomingExamsFromDB = async (
   }
   const eligibleCourseIds = Array.from(courseIdSet);
 
-  const now = new Date();
-  // YYYY-MM-DD derived from local-time components so it lines up with
-  // whatever wall-clock date the admin used when creating the exam.
-  const todayStr =
-    `${now.getFullYear()}-` +
-    `${String(now.getMonth() + 1).padStart(2, '0')}-` +
-    `${String(now.getDate()).padStart(2, '0')}`;
-  // `T00:00:00` (no Z) is interpreted in the SERVER's local timezone by
-  // the Postgres driver, which is exactly what we want — it matches
-  // the wall-clock date we just computed.
-  const todayDate = new Date(`${todayStr}T00:00:00`);
+  // Today's exam-date cutoff anchored to the BD-local calendar day so
+  // the "upcoming exams" list matches what the institute considers
+  // "today" regardless of where the server is hosted. Prisma stores
+  // this as the @db.Date column value when used in a comparison.
+  const todayDate = instituteLocalDate(new Date());
 
   const where: Prisma.ExamWhereInput = {
     courseId: { in: eligibleCourseIds },

@@ -105,12 +105,13 @@ const createCourseToDB = async (payload: TCreateCourse) => {
     });
     for (const [position, day] of payload.batchDays.entries()) {
       // Pad slotStates to match times.length (legacy rows + first-time
-      // creates default to all-ON). The "exactly one ON" invariant
-      // is enforced on read in getCurrentBatchFromDB, not here —
-      // admins can create a batch with multiple slots all-ON;
-      // the service flips siblings OFF the moment the admin toggles
-      // a slot in the UI. Keeping create permissive avoids rejecting
-      // a perfectly valid initial state ("all slots admitting").
+      // creates default to all-ON). Slot states are per-slot and
+      // independent — admins can create a batch with multiple slots
+      // all-ON. The kiosk only promotes the slot whose wall-clock
+      // window is currently open, so co-ON slots don't fight each
+      // other at scan time. Keeping create permissive avoids
+      // rejecting a perfectly valid initial state ("all slots
+      // admitting").
       const slotStates = normaliseSlotStates(day.slotStates, day.times.length);
       const manualWindowOverride = normaliseBooleanArray(
         day.manualWindowOverride,
@@ -143,9 +144,6 @@ const createCourseToDB = async (payload: TCreateCourse) => {
 const getAllCoursesFromDB = async (filters: TGetAllCourses) => {
   const { page, limit, skip, sortBy, sortOrder } = calculatePagination(filters);
   const where: Prisma.CourseWhereInput = { isDeleted: false };
-  if (filters.isActive !== undefined) {
-    where.isActive = filters.isActive === 'true' || filters.isActive === true;
-  }
   // Course-level status filter (replaces the boolean `isCompleted`
   // filter). Tri-state enum narrows the list to one lifecycle stage.
   if (filters.status !== undefined) {
@@ -332,10 +330,6 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
     data.totalSeats = payload.totalSeats;
   }
 
-  if (payload.isActive !== undefined) {
-    data.isActive = payload.isActive;
-  }
-
   if (payload.status !== undefined) {
     // Same side-effect semantics as the dedicated setStatus endpoint:
     // COMPLETE stamps completedAt + flips isAllowAdmitAnotherCourse on;
@@ -422,8 +416,9 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
         // length. If the admin omitted slotStates in the form
         // payload, default to all-ON so legacy / first-time writes
         // continue to accept scans until the admin explicitly
-        // toggles a slot OFF. The "exactly one ON" invariant is
-        // enforced by the kiosk toggle action, not here.
+        // toggles a slot OFF. Slot states are per-slot and
+        // independent — see `toggleBatchSlotToDB` for the
+        // per-slot write semantics.
         const slotStates = normaliseSlotStates(day.slotStates, day.times.length);
         const manualWindowOverride = normaliseBooleanArray(
           day.manualWindowOverride,
@@ -671,17 +666,6 @@ const updateCourseInDB = async (id: string, payload: TUpdateCourse['body']) => {
   return updated;
 };
 
-const toggleCourseActiveToDB = async (id: string, isActive: boolean) => {
-  const existing = await prisma.course.findUnique({ where: { id } });
-  if (!existing) throw new AppError(httpStatus.NOT_FOUND, 'Course not found');
-  const updated = await prisma.course.update({
-    where: { id },
-    data: { isActive },
-  });
-  await clearCourseCache();
-  return updated;
-};
-
 /**
  * Independent override for the `isAllowAdmitAnotherCourse` enrollment
  * gate. Decouples the gate from `status` so an admin can:
@@ -765,24 +749,25 @@ const deleteCourseFromDB = async (id: string) => {
 /**
  * Flip a single slot's `slotEnabled` flag.
  *
- * Cross-course invariant (the "one at a time" rule): only one
- * slot can be ON across ALL BatchDays of ALL courses at any
- * time. Flipping a slot ON in course A auto-disables every
- * other slot in every other course so the kiosk can never
- * serve two slots concurrently — the operator can only ever
- * have one live-admit slot open system-wide.
+ * Slots are fully independent — toggling a slot ON or OFF only
+ * mutates the target slot's `slotStates[i]`. Sibling slots across
+ * the same course (and across other courses) are untouched, so
+ * multiple slots can be ON at the same time. The admin manually
+ * manages each slot's admit state; this endpoint is the
+ * per-slot write that powers the Courses page switch.
  *
- * Flipping a slot OFF leaves siblings alone — turning off the
- * lone ON slot results in zero ON, which is the admin's intent
- * (they can pick another slot to enable next).
+ * The kiosk / current-batch endpoint already only surfaces a
+ * "current" slot when it falls inside the wall-clock window of
+ * an ON slot — with the per-slot state independent, the kiosk
+ * will simply pick the one that's currently running. Cross-slot
+ * coordination is no longer the server's job.
  *
  * Status gate: only `ONGOING` courses can have slot states
- * toggled. The "exactly one ON" rule is only meaningful for
- * active classes — an ADMISSION course hasn't started yet, and
- * a COMPLETE course has already graduated, so neither has a
- * need for a live-admit slot. Reject toggles on non-ONGOING
- * courses with a 400 so the Courses page UI can hide the
- * switch entirely.
+ * toggled. An ADMISSION course hasn't started yet and a
+ * COMPLETE course has already graduated, so neither has a need
+ * for a live-admit slot. Reject toggles on non-ONGOING courses
+ * with a 400 so the Courses page UI can hide the switch
+ * entirely.
  */
 const toggleBatchSlotToDB = async (
   courseId: string,
@@ -816,83 +801,19 @@ const toggleBatchSlotToDB = async (
     );
   }
 
-  /*
-   * Cross-course scope: pull EVERY BatchDay across the database
-   * (joined to the parent course so we have the course name
-   * for the activity log). This is a single round-trip — the
-   * `BatchDay` table is small (a few dozen rows even on a
-   * large install) so the in-memory sweep is fast and avoids
-   * a per-row write loop. We pad / normalise each row's
-   * `slotStates` to its `times.length` so the new flag lands
-   * on the correct index even for legacy rows with a short
-   * array.
-   */
-  const allBatchDays = await prisma.batchDay.findMany({
-    select: {
-      id: true,
-      times: true,
-      slotStates: true,
-      course: { select: { id: true, name: true } },
-    },
-  });
+  // Per-slot toggle — only the target slot's flag flips, siblings
+  // untouched. We pad the array to `times.length` so the new flag
+  // lands on the correct index even for legacy rows with a short
+  // array, then write the full padded array back to keep the
+  // parallel-to-`times[]` invariant.
+  const padded = normaliseSlotStates(batchDay.slotStates, batchDay.times.length);
+  padded[payload.slotIndex] = payload.enabled;
 
-  const updates: Array<{ id: string; slotStates: boolean[] }> = [];
-  for (const bd of allBatchDays) {
-    const padded = normaliseSlotStates(bd.slotStates, bd.times.length);
-    if (payload.enabled) {
-      /*
-       * Admin forced this slot ON — override any other manual
-       * ON across the system (per the user's "only one manual
-       * ON at a time" rule). The target slot flips to `true`;
-       * every other slot in the database flips to `false` so the
-       * kiosk can never serve two slots concurrently. Sibling
-       * slots that were previously ON are now OFF — that's
-       * intentional: turning one slot ON in course A means no
-       * other course can have a live-admit slot open, and the
-       * operator has to manually re-enable a slot in course B
-       * (or another slot in course A) when they want to switch.
-       */
-      for (let i = 0; i < padded.length; i++) {
-        if (bd.id === batchDay.id && i === payload.slotIndex) {
-          padded[i] = true;
-        } else {
-          padded[i] = false;
-        }
-      }
-    } else {
-      // Admin forced this slot OFF — only the target slot
-      // flips; siblings everywhere stay as they are.
-      if (bd.id === batchDay.id) {
-        padded[payload.slotIndex] = false;
-      }
-    }
-    updates.push({ id: bd.id, slotStates: padded });
-  }
-
-  // Apply all updates in a single transaction so the global
-  // invariant either holds across every row or rolls back
-  // together. Each update is independent so the array
-  // iteration is fine; the $transaction wrapper is what
-  // makes "all rows update or none" possible.
-  await prisma.$transaction(
-    updates.map((u) =>
-      prisma.batchDay.update({
-        where: { id: u.id },
-        data: { slotStates: u.slotStates },
-      }),
-    ),
-  );
-
-  // Re-read the target row so the response carries the
-  // post-update slotStates array (used by the toast / UI to
-  // confirm the toggle landed).
-  const updated = await prisma.batchDay.findUnique({
+  const updated = await prisma.batchDay.update({
     where: { id: batchDay.id },
+    data: { slotStates: padded },
     include: { course: { select: { id: true, name: true } } },
   });
-  if (!updated) {
-    throw new AppError(httpStatus.INTERNAL_SERVER_ERROR, 'BatchDay vanished mid-toggle');
-  }
 
   await prisma.activityLog.create({
     data: {
@@ -918,19 +839,30 @@ const toggleBatchSlotToDB = async (
 /**
  * Toggle the per-slot "check-in window override" flag. The
  * default check-in window opens at class start and closes 5
- * minutes after; this override lets the admin open the
- * window early (e.g. admit a parent who's early) or keep
- * it open past the 5-min mark (e.g. when the class was
- * delayed). The override is per-slot, independent of the
- * `slotStates[i]` admit flag — a slot can have the override
- * on while still being admit-disabled, but the kiosk's
- * check-in guard rejects scans for disabled slots
- * regardless of the override state.
+ * minutes after; this override lets the admin open the window
+ * early (e.g. admit a parent who's early) or keep it open
+ * past the 5-min mark (e.g. when the class is delayed).
  *
- * Updates only the targeted `manualWindowOverride[i]` element;
- * siblings are untouched. The service writes back the
- * full padded array so the parallel shape stays in sync
- * with `times[]`.
+ * Cross-slot invariant: only ONE override can be open across
+ * the entire database at any time. Opening the override on
+ * slot X auto-closes every other slot's override (across all
+ * courses), so the kiosk can never serve two override-open
+ * slots concurrently. The cascade applies whenever the
+ * override is being opened (`open: true`) — closing an
+ * override is a per-slot no-op on siblings.
+ *
+ * Pre-condition: the override can only be opened if the
+ * target slot's `slotStates[i]` is `true`. The override is a
+ * "skip the 5-min wall-clock guard" switch — it only makes
+ * sense on a slot that's already admitting scans. Opening the
+ * override on an OFF slot is rejected with a 400 so the admin
+ * doesn't accidentally create a window that the `slotStates`
+ * guard will then reject. The override endpoint NEVER writes
+ * `slotStates[]` — the two flags are independent and managed
+ * by separate toggles.
+ *
+ * Status gate: same as `toggleBatchSlotToDB` — only `ONGOING`
+ * courses can have their slots overridden.
  */
 const setSlotWindowOverrideToDB = async (
   courseId: string,
@@ -952,7 +884,13 @@ const setSlotWindowOverrideToDB = async (
 
   const batchDay = await prisma.batchDay.findUnique({
     where: { id: payload.batchDayId },
-    select: { id: true, courseId: true, manualWindowOverride: true, times: true },
+    select: {
+      id: true,
+      courseId: true,
+      manualWindowOverride: true,
+      slotStates: true,
+      times: true,
+    },
   });
   if (!batchDay || batchDay.courseId !== courseId) {
     throw new AppError(httpStatus.NOT_FOUND, 'BatchDay not found in this course');
@@ -964,14 +902,94 @@ const setSlotWindowOverrideToDB = async (
     );
   }
 
-  const padded = normaliseBooleanArray(batchDay.manualWindowOverride, batchDay.times.length, false);
-  padded[payload.slotIndex] = payload.open;
+  // Pre-condition: the override can only be opened on a slot
+  // whose `slotStates[i]` is `true`. The override is the "skip
+  // the wall-clock guard" switch — it only makes sense on a
+  // slot that's already admitting scans. If the admin is
+  // trying to open an override on an OFF slot, reject with
+  // 400 so they don't accidentally create a window that the
+  // admit guard will then reject.
+  if (payload.open) {
+    const paddedStates = normaliseSlotStates(batchDay.slotStates, batchDay.times.length);
+    if (paddedStates[payload.slotIndex] !== true) {
+      throw new AppError(
+        httpStatus.BAD_REQUEST,
+        "Cannot open the window override on a slot that isn't admitting. Turn the slot ON first.",
+      );
+    }
+  }
 
-  const updated = await prisma.batchDay.update({
+  /*
+   * Cross-slot cascade: when `open: true`, flip every other
+   * slot's `manualWindowOverride` to `false` so only the
+   * target slot's override is open across the whole database.
+   * We pull every BatchDay in a single round-trip (the table
+   * is small) and write back the full padded array per row to
+   * keep the parallel-to-`times[]` invariant. The target row
+   * gets its own override flipped to `true`.
+   *
+   * When `open: false`, only the target slot's override flips
+   * to `false` — closing an override is a per-slot no-op on
+   * siblings (mirrors the slot-state toggle's close semantics).
+   */
+  const allBatchDays = await prisma.batchDay.findMany({
+    select: {
+      id: true,
+      times: true,
+      manualWindowOverride: true,
+    },
+  });
+
+  const updates: Array<{ id: string; manualWindowOverride: boolean[] }> = [];
+  for (const bd of allBatchDays) {
+    const padded = normaliseBooleanArray(
+      bd.manualWindowOverride,
+      bd.times.length,
+      false,
+    );
+    if (payload.open) {
+      for (let i = 0; i < padded.length; i++) {
+        if (bd.id === batchDay.id && i === payload.slotIndex) {
+          padded[i] = true;
+        } else {
+          padded[i] = false;
+        }
+      }
+    } else {
+      if (bd.id === batchDay.id) {
+        padded[payload.slotIndex] = false;
+      }
+    }
+    updates.push({ id: bd.id, manualWindowOverride: padded });
+  }
+
+  // Apply all updates in a single transaction so the global
+  // invariant ("exactly one override open at a time") either
+  // holds across every row or rolls back together. Individual
+  // updates are independent; the $transaction wrapper is what
+  // makes "all rows update or none" possible.
+  await prisma.$transaction(
+    updates.map((u) =>
+      prisma.batchDay.update({
+        where: { id: u.id },
+        data: { manualWindowOverride: u.manualWindowOverride },
+      }),
+    ),
+  );
+
+  // Re-read the target row so the response carries the
+  // post-update manualWindowOverride array (used by the toast
+  // / UI to confirm the override landed).
+  const updated = await prisma.batchDay.findUnique({
     where: { id: batchDay.id },
-    data: { manualWindowOverride: padded },
     include: { course: { select: { id: true, name: true } } },
   });
+  if (!updated) {
+    throw new AppError(
+      httpStatus.INTERNAL_SERVER_ERROR,
+      'BatchDay vanished mid-override',
+    );
+  }
 
   await prisma.activityLog.create({
     data: {
@@ -1000,7 +1018,6 @@ export const CourseService = {
   getCourseByIdFromDB,
   getCourseSeatsFromDB,
   updateCourseInDB,
-  toggleCourseActiveToDB,
   toggleCourseAdmitAnotherCourseToDB,
   setCourseStatusToDB,
   toggleBatchSlotToDB,

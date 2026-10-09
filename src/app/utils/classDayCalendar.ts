@@ -1,4 +1,93 @@
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
+
+// The institute's calendar timezone. All attendance-date decisions
+// (what counts as "today", which weekday a scan falls on, etc.) are
+// anchored here. Pinning a single timezone rather than relying on
+// the SERVER's TZ env keeps behavior stable across local dev
+// machines (usually UTC), Linux containers (often UTC), and the
+// institute's actual wall clock (Asia/Dhaka).
+//
+// Centralised here so every helper in this module reads from the
+// same source of truth. Extend the dayjs instance with utc + timezone
+// once at module load — these are no-ops if already extended, and
+// dayjs.extend is idempotent per plugin.
+dayjs.extend(utc);
+dayjs.extend(timezone);
+const INSTITUTE_TZ = 'Asia/Dhaka';
+
+/**
+ * "Today" as a JS Date representing midnight at the start of the
+ * institute's current calendar day. The returned Date's UTC instant
+ * is whatever `1970-01-01T00:00:00 in Asia/Dhaka` happens to be — the
+ * important property is that `.getDay()`, `dayjs(t).format('ddd')`,
+ * and any other day-of-week / date formatting yield the institute's
+ * local weekday, NOT the server's local weekday.
+ *
+ * Use this everywhere a "what date is it right now from the
+ * institute's perspective" decision is made — checking today's
+ * attendance, picking a cron tick's date, etc.
+ *
+ * Callers that just need the weekday name should use
+ * `weekdayNameForInstituteToday()` instead, which avoids the Date
+ * round trip entirely.
+ */
+export const getInstituteToday = (): Date => dayjs().tz(INSTITUTE_TZ).startOf('day').toDate();
+
+/**
+ * The weekday name for "today" from the institute's perspective.
+ * Equivalent to `weekdayNameFor(getInstituteToday())` but skips the
+ * intermediate Date so there's no chance of accidentally using a
+ * server-local Date somewhere downstream.
+ */
+export const weekdayNameForInstituteToday = (): TWeekdayName => {
+  const name = WEEKDAY_NAMES[dayjs().tz(INSTITUTE_TZ).day()];
+  return name as TWeekdayName;
+};
+
+/**
+ * Like `instituteDateOnly` but reads the weekday in the institute's
+ * timezone. Use this for any day-of-week decision that should be
+ * anchored to BD local time rather than the server's local TZ.
+ */
+export const weekdayNameForInstitute = (d: Date): TWeekdayName => {
+  const name = WEEKDAY_NAMES[dayjs.utc(d).tz(INSTITUTE_TZ).day()];
+  return name as TWeekdayName;
+};
+
+/**
+ * Build the JS Date that should be handed to Prisma when writing into a
+ * `@db.Date` column (e.g. `Attendance.date`, `Exam.examDate`, etc.).
+ *
+ * Why a separate helper from `dayjs(d).startOf('day').toDate()`?
+ *   Postgres `@db.Date` has no time component and no TZ of its own —
+ *   the date it stores is whatever the JS Date's UTC date components
+ *   happen to be, because Prisma's PG driver serialises the JS Date
+ *   by extracting its UTC year/month/day. So if we want the column
+ *   to read as `2026-10-08`, we MUST pass Prisma a JS Date whose UTC
+ *   date parts are `2026-10-08`.
+ *
+ * The returned Date is always a UTC-midnight Date whose UTC date
+ * parts equal the BD-local YYYY-MM-DD. On read, Prisma hydrates a
+ * `@db.Date` column to `T00:00:00.000Z` in UTC, which is exactly the
+ * shape we return here — so reads round-trip cleanly.
+ *
+ * Use this for any value being written to or compared against a
+ * `@db.Date` column.
+ */
+export const instituteLocalDate = (d: Date): Date => {
+  const bd = dayjs.utc(d).tz(INSTITUTE_TZ);
+  return new Date(Date.UTC(bd.year(), bd.month(), bd.date()));
+};
+
+/**
+ * Build the BD-local YYYY-MM-DD string for an arbitrary Date. Useful
+ * for error messages, activity log descriptions, and other places
+ * where a printable date string is preferred over a Date object.
+ */
+export const instituteLocalDateString = (d: Date): string =>
+  dayjs.utc(d).tz(INSTITUTE_TZ).format('YYYY-MM-DD');
 
 /**
  * Parse an "h:mm AM/PM" string (the format `BatchDay.times[]` and
@@ -6,10 +95,9 @@ import dayjs from 'dayjs';
  * minutes-since-midnight number. Returns `null` on malformed input
  * so the caller can skip rather than crash on a typo'd schedule.
  *
- * Centralised here (rather than duplicated in `attendance.service.ts`
- * as `parseTimeOfDay`) because both the current-batch feature and
- * the 5-min scan-window guard depend on the same parse — keeping
- * one definition ensures they always agree on edge cases like
+ * Centralised here because both the current-batch feature and the
+ * 5-min scan-window guard depend on the same parse — keeping one
+ * definition ensures they always agree on edge cases like
  * midnight-spanning times.
  */
 export const parseTimeOfDay = (raw: string): number | null => {
@@ -25,29 +113,21 @@ export const parseTimeOfDay = (raw: string): number | null => {
 };
 
 /**
- * Calendar-class-day helpers. Used by `attendance.service.ts` to resolve
- * a barcode/NFC scan on a peer-batch day into an attendance row stamped
- * for the student's dedicated class day.
+ * Calendar-class-day helpers. Used by `attendance.service.ts` to
+ * decide whether a barcode / NFC scan happened on a day the student
+ * is enrolled in.
  *
- * The rule (per the absent-warning discussion + the user's spec):
- *   A student enrolled in Batch A = [Sat, Mon, Wed] with the course's
- *   union of class days = [Sun, Mon, Tue, Wed, Thu, Sat] (Batch B =
- *   [Sun, Tue, Thu] shares no days with Batch A) can make up a missed
- *   class by attending the previous OR next class day in the union, but
- *   never skip a day. So:
- *     - Sunday scan → record for Saturday (prev-in-union, dedicated).
- *     - Tuesday scan → record for Monday (prev-in-union, dedicated).
- *     - Thursday scan → record for Wednesday (prev-in-union, dedicated).
- *     - Saturday scan when student is in Batch B → record for Sunday
- *       (next-in-union, dedicated).
- *     - Friday scan → reject ("no class scheduled in your course today").
- *     - Saturday scan when student is in Batch A → normal (no swap).
- *     - Monday/Wednesday scan for Batch A student → normal (no swap).
+ * Make-up attendance is no longer supported — students can only attend
+ * their own enrolled slot. The resolver below therefore has only two
+ * outcomes:
+ *   - `normal`         — today IS in the student's dedicated day set;
+ *                        record the row for today.
+ *   - `no_class_today` — today is NOT in the student's dedicated set;
+ *                        reject the scan.
  *
- * Same algorithm captures both the "missed class → make up the next
- * union day" direction AND the "emergency on dedicated day → attended
- * the previous union day" direction because both are just "scan day is
- * adjacent to a dedicated day in the cyclic union".
+ * If we ever re-introduce make-up classes, the resolver would need to
+ * grow again — for now the simple binary rule keeps the kiosk + manual
+ * check-in paths trivial.
  */
 
 export const WEEKDAY_NAMES = [
@@ -68,9 +148,7 @@ export type TWeekdayName = (typeof WEEKDAY_NAMES)[number];
 // explicit annotation here is defensive in case TS narrows it back
 // to the literal union type (which would break `.has(lower)` for
 // mixed-case input).
-const WEEKDAY_SET_LOWER: ReadonlySet<string> = new Set(
-  WEEKDAY_NAMES.map((w) => w.toLowerCase()),
-);
+const WEEKDAY_SET_LOWER: ReadonlySet<string> = new Set(WEEKDAY_NAMES.map((w) => w.toLowerCase()));
 
 /**
  * Inverse of `weekdayNameFor` in `student.service.ts`. Returns 0..6 for
@@ -79,9 +157,7 @@ const WEEKDAY_SET_LOWER: ReadonlySet<string> = new Set(
  * typos as Friday (=6).
  */
 export const weekdayIndexFor = (name: string): number => {
-  const idx = WEEKDAY_NAMES.findIndex(
-    (w) => w.toLowerCase() === name.trim().toLowerCase(),
-  );
+  const idx = WEEKDAY_NAMES.findIndex((w) => w.toLowerCase() === name.trim().toLowerCase());
   if (idx === -1) {
     throw new Error(`Invalid weekday name: ${JSON.stringify(name)}`);
   }
@@ -104,8 +180,8 @@ export const weekdayNameFor = (d: Date): TWeekdayName => {
  * Normalise a `BatchDay.days[]` array (free-form user input preserved
  * case-insensitively) to a deduped set of canonical weekday names.
  * Unknown values are dropped silently — the UI may have leftover
- * legacy rows with typo'd day names; the attendance swap just ignores
- * them and treats the rest.
+ * legacy rows with typo'd day names; the resolver just ignores them
+ * and treats the rest.
  */
 const normaliseDays = (days: string[] | null | undefined): TWeekdayName[] => {
   if (!days || days.length === 0) return [];
@@ -130,26 +206,10 @@ export type TClassDayBatchDay = {
 };
 
 /**
- * Compute the cyclic union of all `BatchDay.days[]` rows in a course,
- * sorted by Sunday-first weekday index. e.g. Batch A = [Sat,Mon,Wed]
- * + Batch B = [Sun,Tue,Thu] → ['Sun','Mon','Tue','Wed','Thu','Sat']
- * (Friday is skipped because neither batch runs on Friday).
- */
-export const buildCourseClassDayUnion = (
-  batchDays: TClassDayBatchDay[],
-): TWeekdayName[] => {
-  const seen = new Set<TWeekdayName>();
-  for (const b of batchDays) {
-    for (const day of normaliseDays(b.days)) seen.add(day);
-  }
-  return Array.from(seen).sort((a, b) => weekdayIndexFor(a) - weekdayIndexFor(b));
-};
-
-/**
  * A single StudentBatch row with its related BatchDay (so we can read
  * `days`). The denormalised `batchDay` field on StudentBatch (e.g.
- * "SAT") is for the legacy enum-style filter on `getToday`; the swap
- * rule needs the *full* days[] array so we ignore it here.
+ * "SAT") is for the legacy enum-style filter on `getToday`; the
+ * resolver needs the *full* days[] array so we ignore it here.
  */
 export type TClassDayStudentBatch = {
   batchDayId: string | null;
@@ -168,11 +228,9 @@ export type TClassDayStudentBatch = {
 };
 
 /**
- * Returns the canonical "dedicated" days for a student — the days in
- * their OWN BatchDay row. A student enrolled in one BatchDay row has
- * exactly those days; a student enrolled in multiple rows in the same
- * course (rare — would be two enrollments in the same course) unions
- * them.
+ * Compute the "dedicated" days for a student — the days in their
+ * OWN BatchDay row (a student enrolled in multiple rows in the same
+ * course unions them).
  */
 export const buildDedicatedClassDays = (
   studentBatches: TClassDayStudentBatch[],
@@ -186,47 +244,37 @@ export const buildDedicatedClassDays = (
 };
 
 /**
- * Output of `resolveAttendanceDate`. Tagged union so callers must
- * handle every variant explicitly.
+ * Outcome of `resolveTodayAgainstStudentBatches`. Tagged union so
+ * callers must handle every variant explicitly.
  *
- *   normal           — scan day is one of the student's dedicated
- *                      days; record for scan day, no swap.
- *   swap             — scan day is in the course union but not in the
- *                      student's dedicated set; exactly one neighbor in
- *                      the cyclic union IS dedicated; record for the
- *                      dedicated day, stamp `swapFromDate = scan day`.
- *   no_class_today   — scan day is not in the union at all (e.g. Friday
- *                      when both batches skip Friday).
- *   not_eligible     — scan day is in the union but neither neighbor is
- *                      dedicated. The student is trying to swap across
- *                      more than one class day, which the user
- *                      explicitly disallowed.
- *   no_peer_batch    — student has only one active BatchDay row in
- *                      this course; no swap is possible.
- *
- * The `startsAtMinutes` field (when set) carries the wall-clock start
- * minute-of-day of the resolved class. Callers use it to enforce
- * time-windowed rules like the kiosk's "scan only allowed for the
- * first 5 minutes of the class" gate. It's only meaningful on the
- * `normal` / `swap` variants — the rejection variants don't pick a
- * batch to validate against.
+ *   normal           — today IS one of the student's dedicated
+ *                      class days; record for today.
+ *                      `startsAtMinutes` carries the wall-clock start
+ *                      of the matched slot so the caller can enforce
+ *                      time-windowed rules like the kiosk's
+ *                      "scan only allowed for the first 5 minutes
+ *                      of the class" gate.
+ *   no_class_today   — today is NOT one of the student's dedicated
+ *                      class days (the student tried to scan on a
+ *                      day they aren't enrolled in). Caller should
+ *                      reject with a 400.
+ *   no_enrollment    — the student has no active enrollment (no
+ *                      StudentBatch rows attached to a live
+ *                      BatchDay). Caller should reject with a 400.
  */
-export type TSwapResolution =
-  | { kind: 'normal'; date: Date; startsAtMinutes: number }
-  | { kind: 'swap'; date: Date; swapFromDate: Date; startsAtMinutes: number }
+export type TTodayResolution =
+  | { kind: 'normal'; startsAtMinutes: number }
   | { kind: 'no_class_today' }
-  | { kind: 'not_eligible' }
-  | { kind: 'no_peer_batch' };
+  | { kind: 'no_enrollment' };
 
 /**
- * Build the `startsAtMinutes` from the student's own batch rows for
- * the resolved weekday. Returns `null` if the student isn't enrolled
- * in a slot that runs on that weekday OR if their `batchTime` is
- * malformed (so the 5-min check-in window guard can treat the scan
- * as ambiguous and skip the guard rather than reject on bad data).
- *
- * Picked by the resolver, not by the consumer, so the contract for
- * the `startsAtMinutes` field is consistent across all callers.
+ * Find the first StudentBatch row whose BatchDay `days[]` includes
+ * `weekday` and whose `batchTime` parses cleanly. Returns `null` if
+ * no such row exists or the batchTime is unparseable. When no
+ * parseable slot is found, the caller can default to 0 (midnight) so
+ * the 5-min check-in window guard naturally rejects the scan — the
+ * alternative would be to throw, which would crash the check-in flow
+ * on a single bad row.
  */
 const pickStudentSlotStart = (
   studentBatches: TClassDayStudentBatch[],
@@ -243,26 +291,22 @@ const pickStudentSlotStart = (
 };
 
 /**
- * Try to resolve a scan date to the date the attendance row should be
- * stamped with. See TSwapResolution for the outcomes.
+ * Decide whether a scan happening RIGHT NOW should be accepted as a
+ * normal check-in, and (if so) what the wall-clock start of the
+ * student's enrolled slot is.
  *
- * `studentBatches` — the student's own active StudentBatch rows for
- * this course. Drives the "dedicated" set (which days this student is
- * normally expected to attend).
+ * Make-up attendance is no longer supported — students can only attend
+ * their own enrolled slot. A scan on a day the student isn't enrolled
+ * in is rejected with `{ kind: 'no_class_today' }` so the caller can
+ * surface a helpful 400 ("No class scheduled for your batch today").
  *
- * `courseBatchDays` — every BatchDay row attached to this course,
- * regardless of whether the student is enrolled in it. Drives the
- * "union" set (every day the course runs any class). Needed because a
- * student's own batches only cover their own batch — to detect the
- * peer-batch swap, the helper needs to see all batches in the course.
+ * `studentBatches` — the student's active StudentBatch rows. Drives
+ * the "dedicated" set (which days this student is normally expected
+ * to attend).
  */
-export const resolveAttendanceDate = (params: {
-  scanDate: Date;
-  studentBatches: TClassDayStudentBatch[];
-  courseBatchDays: TClassDayBatchDay[];
-}): TSwapResolution => {
-  const { scanDate, studentBatches, courseBatchDays } = params;
-
+export const resolveTodayAgainstStudentBatches = (
+  studentBatches: TClassDayStudentBatch[],
+): TTodayResolution => {
   // Drop soft-deleted or unlinked student-batch rows up front. A
   // StudentBatch with no batchDayRel means the BatchDay was deleted;
   // treat it as inactive.
@@ -270,105 +314,23 @@ export const resolveAttendanceDate = (params: {
     (sb) => sb.batchDayRel !== null && sb.batchDayRel !== undefined,
   );
   if (active.length === 0) {
-    return { kind: 'no_peer_batch' };
+    return { kind: 'no_enrollment' };
   }
 
-  // Single-batch course: no peer batch exists, so no swap can resolve.
-  // Per the user's chosen behaviour, we reject the scan with a helpful
-  // message rather than silently falling back to a normal check-in.
-  if (courseBatchDays.length <= 1) {
-    return { kind: 'no_peer_batch' };
-  }
-
-  // Build the union (across the entire course) + the dedicated set
-  // (just this student's own batch days). When the course has multiple
-  // batches, the dedicated set is a strict subset of the union.
-  const union = buildCourseClassDayUnion(courseBatchDays);
   const dedicated = buildDedicatedClassDays(active);
-  if (union.length === 0) {
+  if (dedicated.length === 0) {
+    return { kind: 'no_enrollment' };
+  }
+
+  const todayWeekday = weekdayNameForInstituteToday();
+  if (!dedicated.includes(todayWeekday)) {
     return { kind: 'no_class_today' };
   }
 
-  const scanWeekday = weekdayNameFor(scanDate);
-  const unionIdx = union.indexOf(scanWeekday);
-  if (unionIdx === -1) {
-    return { kind: 'no_class_today' };
-  }
-
-  // Scan day is on the dedicated set — normal check-in.
-  if (dedicated.includes(scanWeekday)) {
-    // `active` (filtered) is the student's own batch rows for this
-    // course. Pick the first row whose `batchDayRel.days[]` contains
-    // the scan weekday — that's the slot the student is enrolled in.
-    // A student in multiple batches within the same course is rare;
-    // we take the first match. `batchTime` is the single string
-    // start-of-class for that slot.
-    //
-    // When the student has no parseable slot (e.g. legacy row with
-    // a malformed `batchTime`), default to 0 (midnight) so the
-    // check-in window guard naturally rejects the scan — the
-    // alternative would be to throw, which would crash the
-    // check-in flow on a single bad row.
-    const slotStart = pickStudentSlotStart(active, scanWeekday) ?? 0;
-    return {
-      kind: 'normal',
-      date: dayjs(scanDate).startOf('day').toDate(),
-      startsAtMinutes: slotStart,
-    };
-  }
-
-  // Walk ±1 in the cyclic union and check whether either neighbour is
-  // a dedicated day. Only one of the two cases can apply at a time
-  // (a student belongs to one batch, and a dedicated day uniquely
-  // identifies that batch), but we handle the edge case where both
-  // neighbours happen to be dedicated (impossible with the current
-  // data shape but defensive).
-  const prev = union[(unionIdx - 1 + union.length) % union.length];
-  const next = union[(unionIdx + 1) % union.length];
-  const prevDedicated = dedicated.includes(prev);
-  const nextDedicated = dedicated.includes(next);
-
-  if (prevDedicated && !nextDedicated) {
-    // "Missed my dedicated day, came the next union day" — the day
-    // before the scan day is the student's dedicated day. Walk back
-    // 1 calendar day. dayjs handles month/year boundaries cleanly.
-    // The dedicated day for the swap is `prev`, so use that to pick
-    // the slot start.
-    const slotStart = pickStudentSlotStart(active, prev) ?? 0;
-    return {
-      kind: 'swap',
-      date: dayjs(scanDate).subtract(1, 'day').startOf('day').toDate(),
-      swapFromDate: dayjs(scanDate).startOf('day').toDate(),
-      startsAtMinutes: slotStart,
-    };
-  }
-  if (!prevDedicated && nextDedicated) {
-    // "Emergency on my dedicated day, came the previous union day" —
-    // the day after the scan day is the student's dedicated day. Walk
-    // forward 1 calendar day. dayjs handles week/month boundaries.
-    const slotStart = pickStudentSlotStart(active, next) ?? 0;
-    return {
-      kind: 'swap',
-      date: dayjs(scanDate).add(1, 'day').startOf('day').toDate(),
-      swapFromDate: dayjs(scanDate).startOf('day').toDate(),
-      startsAtMinutes: slotStart,
-    };
-  }
-  if (prevDedicated && nextDedicated) {
-    // Both neighbours dedicated — rare; pick the previous-day case and
-    // let the UI / activity log flag the ambiguity. We don't have this
-    // case in the seeded data; it's here so the helper is robust if
-    // someone defines a batch layout that triggers it.
-    const slotStart = pickStudentSlotStart(active, prev) ?? 0;
-    return {
-      kind: 'swap',
-      date: dayjs(scanDate).subtract(1, 'day').startOf('day').toDate(),
-      swapFromDate: dayjs(scanDate).startOf('day').toDate(),
-      startsAtMinutes: slotStart,
-    };
-  }
-
-  // Scan day is in the union but neither neighbour is dedicated — the
-  // student is trying to skip a class day. Reject.
-  return { kind: 'not_eligible' };
+  // Today IS in the dedicated set — find the slot's start minute.
+  // Default to 0 (midnight) so the check-in window guard naturally
+  // rejects the scan rather than crashing on a single malformed
+  // batchTime row.
+  const slotStart = pickStudentSlotStart(active, todayWeekday) ?? 0;
+  return { kind: 'normal', startsAtMinutes: slotStart };
 };

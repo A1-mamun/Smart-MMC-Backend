@@ -1,14 +1,19 @@
 import dayjs from 'dayjs';
-import { Prisma } from '@prisma/client';
 import prisma from '../../utils/prisma';
 import { TAdmissionComparison } from './stats.validation';
+// Importing for the .tz pulse — utc + timezone plugins get extended
+// transitively via classDayCalendar.ts which is already pulled in
+// elsewhere. Re-importing here makes the dependency explicit.
+import '../../utils/classDayCalendar';
 
 const getBatchOrder = () => {
   return ['BATCH_25', 'BATCH_26', 'BATCH_27', 'BATCH_28'] as const;
 };
 
 const getAdmissionComparisonFromDB = async (filters: TAdmissionComparison) => {
-  const today = dayjs();
+  // Anchor year boundaries to Asia/Dhaka so the "this year" cohort
+  // lines up with the institute's calendar, not the server's.
+  const today = dayjs().tz('Asia/Dhaka');
   const lastYearStart = today.subtract(1, 'year').startOf('year').toDate();
   const lastYearEnd = today.subtract(1, 'year').endOf('year').toDate();
   const thisYearStart = today.startOf('year').toDate();
@@ -45,9 +50,12 @@ const getAdmissionComparisonFromDB = async (filters: TAdmissionComparison) => {
     }),
   ]);
 
-  const percentChange = previousCount === 0
-    ? (currentCount > 0 ? 100 : 0)
-    : Math.round(((currentCount - previousCount) / previousCount) * 100);
+  const percentChange =
+    previousCount === 0
+      ? currentCount > 0
+        ? 100
+        : 0
+      : Math.round(((currentCount - previousCount) / previousCount) * 100);
 
   return {
     currentBatch,
@@ -76,7 +84,16 @@ const getBatchWiseCourseStatsFromDB = async () => {
     },
   });
 
-  const map = new Map<string, { hscBatch: string; courseName: string; studentCount: Set<string>; paidCount: number; dueCount: number }>();
+  const map = new Map<
+    string,
+    {
+      hscBatch: string;
+      courseName: string;
+      studentCount: Set<string>;
+      paidCount: number;
+      dueCount: number;
+    }
+  >();
 
   for (const e of enrollments) {
     const batches = e.student.batches;
@@ -111,8 +128,11 @@ const getBatchWiseCourseStatsFromDB = async () => {
 const getCollectionTrendFromDB = async () => {
   const months: { label: string; collected: number; count: number }[] = [];
   for (let i = 5; i >= 0; i--) {
-    const start = dayjs().subtract(i, 'month').startOf('month').toDate();
-    const end = dayjs().subtract(i, 'month').endOf('month').toDate();
+    // Per-month bucket anchored to Asia/Dhaka wall-clock so a payment
+    // made on the last day of a BD month doesn't spill into the next
+    // bucket when the server is in UTC (or any other non-BD TZ).
+    const start = dayjs().tz('Asia/Dhaka').subtract(i, 'month').startOf('month').toDate();
+    const end = dayjs().tz('Asia/Dhaka').subtract(i, 'month').endOf('month').toDate();
     const agg = await prisma.payment.aggregate({
       where: { isDeleted: false, paidAt: { gte: start, lte: end } },
       _sum: { amount: true },
@@ -147,6 +167,3 @@ export const StatsService = {
   getCollectionTrendFromDB,
   getPaymentMethodBreakdownFromDB,
 };
-
-// Suppress unused Prisma import lint warning
-type _Unused = Prisma.InputJsonValue;

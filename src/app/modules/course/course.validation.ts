@@ -52,15 +52,11 @@ const batchDaySchema = z
       .nullable()
       .optional(),
     // Per-slot admit-enabled flag, parallel to `times[]`. Optional
-    // on input; the service layer pads/trims to match `times.length`
-    // and enforces the "exactly one ON" invariant on every read.
-    // Default: omitted / empty array → all slots ON.
-    // Per-slot "barcode scan allowed right now" flag, parallel
-    // to `times[]`. Strictly binary — no tri-state, no
-    // auto-cycle. The admin turns a slot ON at class start
-    // and OFF at class end. The toggle endpoint enforces the
-    // global invariant "only one ON across the entire
-    // database".
+    // on input; the service layer pads/trims to match `times.length`.
+    // Slot states are per-slot and independent — multiple slots can
+    // be ON at the same time (the kiosk only surfaces the slot whose
+    // wall-clock window is currently open). Default: omitted / empty
+    // array → all slots ON.
     slotStates: z.array(z.boolean()).optional(),
     // Per-slot "check-in window override". When the i-th
     // element is `true`, the kiosk accepts scans for that
@@ -132,7 +128,6 @@ const updateCourseSchema = z.object({
     hscBatch: z.enum(hscBatches).optional(),
     totalSeats: z.coerce.number().int().min(1).max(10000).nullable().optional(),
     batchDays: z.array(batchDaySchema).min(1).max(7).optional(),
-    isActive: z.boolean().optional(),
     // Course-level status (ADMISSION / ONGOING / COMPLETE). Most admins
     // will use the dedicated `setStatusSchema` endpoint (single-click
     // transition that also keeps `isAllowAdmitAnotherCourse` in sync),
@@ -151,7 +146,6 @@ const updateCourseSchema = z.object({
 
 const getAllCoursesSchema = z.object({
   query: z.object({
-    isActive: z.union([z.boolean(), z.string()]).optional(),
     // Course-level status filter. Tri-state on the wire: undefined
     // returns everyone; one of ADMISSION/ONGOING/COMPLETE narrows to
     // that stage.
@@ -166,11 +160,6 @@ const getAllCoursesSchema = z.object({
 
 const idParamSchema = z.object({
   params: z.object({ id: z.string().uuid() }),
-});
-
-const toggleActiveSchema = z.object({
-  params: z.object({ id: z.string().uuid() }),
-  body: z.object({ isActive: z.boolean() }),
 });
 
 // Dedicated lifecycle endpoint — single-click status transition from
@@ -200,10 +189,10 @@ const toggleAdmitAnotherCourseSchema = z.object({
 
 /**
  * Per-slot "Take attendance" toggle. The admin sets
- * `enabled = true` for the slot they want the kiosk to scan, and
- * `false` for every other slot. The service enforces the
- * "exactly one ON" invariant (flipping siblings OFF when one goes
- * ON) so the kiosk can never serve two slots concurrently.
+ * `enabled = true` or `false` for the target slot. The service
+ * flips only that slot — siblings stay as the admin left them.
+ * Multiple slots can be ON at the same time; the kiosk only
+ * surfaces the slot whose wall-clock window is currently open.
  *
  * `batchDayId` is required to disambiguate which BatchDay the
  * slot belongs to (a course can have multiple BatchDays, each
@@ -264,7 +253,6 @@ export const CourseValidation = {
   updateCourseSchema,
   getAllCoursesSchema,
   idParamSchema,
-  toggleActiveSchema,
   setStatusSchema,
   toggleAdmitAnotherCourseSchema,
   toggleBatchSlotSchema,

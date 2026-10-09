@@ -61,14 +61,6 @@ router.delete(
 );
 
 router.patch(
-  '/:id/toggle-active',
-  Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
-  writeOperationRateLimiter,
-  validateRequest(CourseValidation.toggleActiveSchema),
-  CourseController.toggleActive,
-);
-
-router.patch(
   '/:id/status',
   Auth(USER_ROLE.SUPER_ADMIN, USER_ROLE.ADMIN),
   writeOperationRateLimiter,
@@ -93,12 +85,13 @@ router.patch(
 /**
  * Per-slot "take attendance" toggle. PATCH body:
  *   { batchDayId, slotIndex, enabled }
- * The service flips that single slot in `BatchDay.slotStates` and
- * auto-disables the other slots in the same BatchDay so the kiosk
- * can never serve two slots concurrently (the "only one slot ON
- * at a time" rule). Re-validating all 4 fields (including the
- * UUID) keeps the endpoint safe from the admin dashboard's
- * auto-save pattern.
+ * The service flips that single slot in `BatchDay.slotStates` —
+ * siblings stay as the admin left them. Multiple slots can be ON
+ * at the same time; the kiosk only surfaces the slot whose
+ * wall-clock window is currently open so the operator never sees
+ * a conflict. Re-validating all 4 fields (including the UUID)
+ * keeps the endpoint safe from the admin dashboard's auto-save
+ * pattern.
  */
 router.patch(
   '/:id/slot-toggle',

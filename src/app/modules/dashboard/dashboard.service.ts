@@ -1,9 +1,14 @@
 import dayjs from 'dayjs';
 import prisma from '../../utils/prisma';
 import { PaymentStatus } from '@prisma/client';
+import { instituteLocalDate } from '../../utils/classDayCalendar';
 
 const getAdminDashboardDataFromDB = async () => {
-  const now = dayjs();
+  // Anchor all date math to Asia/Dhaka — the institute's calendar TZ.
+  // Without this, `now.startOf('day')` uses the SERVER's local TZ and
+  // the "Today's attendance" KPI misses or double-counts every row
+  // straddling midnight UTC vs midnight Asia/Dhaka.
+  const now = dayjs().tz('Asia/Dhaka');
   const startOfMonth = now.startOf('month').toDate();
 
   const [
@@ -40,7 +45,7 @@ const getAdminDashboardDataFromDB = async () => {
       where: { isDeleted: false, dueDate: { lt: now.toDate() }, paidAt: null },
     }),
     prisma.attendance.count({
-      where: { date: now.startOf('day').toDate() },
+      where: { date: instituteLocalDate(now.toDate()) },
     }),
     prisma.attendance.count({
       where: { date: { gte: startOfMonth } },
@@ -177,7 +182,10 @@ const getStudentDashboardDataFromDB = async (userId: string) => {
   });
   if (!student) return null;
 
-  const startOfMonth = dayjs().startOf('month').toDate();
+  // "Start of this month" in Asia/Dhaka wall-clock, otherwise the
+  // "month-to-date attendance" KPI would be one calendar month
+  // ahead/behind for any user not in the server's local TZ.
+  const startOfMonth = dayjs().tz('Asia/Dhaka').startOf('month').toDate();
   const attendanceThisMonth = await prisma.attendance.count({
     where: {
       studentId: student.id,

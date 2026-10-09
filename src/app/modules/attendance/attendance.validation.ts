@@ -30,7 +30,7 @@ const getStudentAttendanceSchema = z.object({
 
 const getTodaySchema = z.object({
   query: z.object({
-    batchDay: z.string().optional(),
+    courseId: z.string().uuid().optional(),
     batchTime: z.string().optional(),
     hscBatch: z.string().optional(),
     page: z.coerce.number().int().min(1).optional(),

@@ -124,6 +124,11 @@ const chunkAndSend = async (
     // `skipDuplicates: true` keeps the operation idempotent under
     // concurrent ticks. A retry flow (manual re-open from the UI)
     // would have to delete the row first, which is fine for v1.
+    //
+    // NOTE: When re-enabling, switch `warnedAt: new Date()` to
+    // `warnedAt: instituteLocalDate(new Date())` so the stored date
+    // matches the BD calendar day the SMS actually fired, not the
+    // server-local day.
     await prisma.examAbsenceWarning.createMany({
       data: chunk.map((c) => ({
         examId: c.examId,

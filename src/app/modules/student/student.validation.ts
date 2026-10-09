@@ -160,8 +160,7 @@ const getAllStudentsSchema = z.object({
     // server-side and match against BatchDay.days[]. `classTime` narrows
     // the match to a single time slot (e.g. "3:00 PM"). `scenarioCourses`
     // is a CSV of course UUIDs used by the bulk-SMS "course-wise" picker.
-    // `hasDue` / `activeCoursesOnly` are the dedicated "due payments" and
-    // "active courses" scenarios.
+    // `hasDue` is the dedicated "due payments" scenario.
     classDate: z.coerce.date().optional(),
     classTime: z.string().optional(),
     scenarioCourses: z.string().optional(),
@@ -171,9 +170,6 @@ const getAllStudentsSchema = z.object({
     // these via `isTruthyQuery()`, which handles both real booleans and
     // stringified "true"/"1", so we leave them as raw `unknown` here.
     hasDue: z
-      .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
-      .optional(),
-    activeCoursesOnly: z
       .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
       .optional(),
     // Free-vs-paid segregation. Paid dashboards pass `false` to hide
@@ -191,11 +187,15 @@ const getAllStudentsSchema = z.object({
       .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
       .optional()
       .transform((v) => (v === undefined ? undefined : v === true || v === 'true' || v === '1')),
-    // ISO yyyy-mm-dd — server resolves to "students enrolled in a
-    // class on this weekday MINUS students with an Attendance row on
-    // this date". Used by the absent-warning SMS picker on
-    // /dashboard/sms. Combines additively with the rest of the
-    // filter chain.
+    // ISO yyyy-mm-dd — server resolves to "students with an
+    // Attendance row whose `status = ABSENT` on this exact
+    // date". Used by the absent-warning SMS picker on
+    // /dashboard/sms. The ABSENT rows are written by the
+    // attendance cron (`attendance.service →
+    // markAbsenteesForFinishedSlotsToDB`) at slot-finish time,
+    // so the picker reflects the system-of-record absence
+    // state and matches what the attendance page shows.
+    // Combines additively with the rest of the filter chain.
     absentOnDate: z.coerce.date().optional(),
     page: z.coerce.number().int().min(1).optional(),
     // Cap raised to 1000 so the bulk-SMS picker can pull the entire cohort

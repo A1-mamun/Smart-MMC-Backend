@@ -88,6 +88,32 @@ enum AttendanceMethod {
   ADMIN
 }
 
+// Per-row attendance outcome.
+//
+//   PRESENT — the student physically checked in for the recorded day
+//             (NFC kiosk or admin manual entry). Written at the time
+//             of the scan.
+//   ABSENT  — the cron absent-marker inserted the row because a class
+//             finished (start time + durationMinutes) and the student
+//             did not check in. The admin can edit / delete later.
+//
+// Make-up attendance is no longer supported — students can only attend
+// their own enrolled slot. Scans on a day the student isn't enrolled
+// in are rejected with a 400 by the check-in service. The cron
+// inserts ABSENT rows for students who never scanned their enrolled
+// slot; a student can also be back-filled manually by the admin via the
+// manual check-in path.
+//
+// The DEFAULT on `Attendance.status` is PRESENT so any historical row
+// inserted before the column existed resolves to PRESENT on read —
+// those rows all came from real check-ins, so PRESENT is the only
+// honest backfill. The cron writes ABSENT explicitly for the rows it
+// inserts, so historical data is preserved.
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+}
+
 enum ExamSectionType {
   MCQ
   WRITTEN
@@ -276,13 +302,17 @@ model Course {
   description               String?
   fee                       Decimal      @db.Decimal(10, 2)
   hscBatch                  HscBatch     @default(BATCH_27)
-  isActive                  Boolean      @default(true)
   // Course lifecycle stage. Drives UI affordances on the Courses page
   // (badge color, picker visibility on the admit form). New courses
   // start in `ADMISSION`. Admins move the course through `ONGOING` →
   // `COMPLETE` from the Courses page (single-click segmented control,
   // no edit modal required). Independent of `isAllowAdmitAnotherCourse`
   // (see below) — status is descriptive, the flag is the gate.
+  //
+  // The old boolean `isActive` column was removed in favour of this
+  // single source of truth — a course is "active" when its `status`
+  // is `ADMISSION` or `ONGOING`, and "inactive" when it's `COMPLETE`.
+  // No more dual-write drift between the two fields.
   status                    CourseStatus @default(ADMISSION)
   // Admin-controlled gate that overrides the natural
   // "one-course-at-a-time" enrollment rule: when `true`, the
@@ -311,7 +341,6 @@ model Course {
   exams           Exam[]
   completedByUser User?           @relation("CourseCompletedBy", fields: [completedBy], references: [id], onDelete: SetNull)
 
-  @@index([isActive])
   @@index([status])
   @@index([isDeleted])
   @@index([hscBatch])
@@ -479,22 +508,23 @@ model Payment {
 }
 
 model Attendance {
-  id           String           @id @default(uuid())
-  studentId    String
-  date         DateTime         @db.Date
-  checkInAt    DateTime         @default(now())
-  method       AttendanceMethod @default(NFC)
-  deviceId     String?
-  recordedBy   String?
-  // Set only when this row is a "make-up" — the recorded `date` is the
-  // student's dedicated class day in their batch, but they physically
-  // checked in on a peer batch's class day. e.g. a Batch A (Sat/Mon/Wed)
-  // student scans on Sunday (peer Batch B's day) → recorded for Saturday,
-  // this field = Sunday. Null for a regular scan. The unique constraint
-  // on (studentId, date) is unchanged, so a student can still only have
-  // one row per dedicated class day.
-  swapFromDate DateTime?        @db.Date
-  createdAt    DateTime         @default(now())
+  id         String           @id @default(uuid())
+  studentId  String
+  date       DateTime         @db.Date
+  checkInAt  DateTime         @default(now())
+  method     AttendanceMethod @default(NFC)
+  // Outcome for THIS row. PRESENT = the student was physically here
+  // for the recorded `date`. ABSENT = the cron inserted this row
+  // because the class finished without a check-in. See the
+  // AttendanceStatus enum docstring for the canonical definitions.
+  //
+  // Make-up attendance is no longer supported — students can only
+  // attend their own enrolled slot. Scans on a day the student isn't
+  // enrolled in are rejected with a 400 by the check-in service.
+  status     AttendanceStatus @default(PRESENT)
+  deviceId   String?
+  recordedBy String?
+  createdAt  DateTime         @default(now())
 
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
@@ -502,7 +532,11 @@ model Attendance {
   @@index([studentId])
   @@index([date])
   @@index([method])
-  @@index([swapFromDate])
+  // Hot path for the absent-marking cron: "all rows on this date
+  // grouped by status". Cheap because the date index is already
+  // selective; this just adds status as a secondary key so the
+  // absent-batch query can filter ABSENT rows without a heap scan.
+  @@index([date, status])
   @@map("attendance")
 }
 

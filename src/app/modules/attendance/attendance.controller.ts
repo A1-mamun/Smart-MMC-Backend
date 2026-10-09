@@ -28,7 +28,11 @@ const manualCheckIn = catchAsync(async (req, res) => {
 });
 
 const getToday = catchAsync(async (req, res) => {
-  const filters = pick(req.query as Record<string, unknown>, ['batchDay', 'batchTime', 'hscBatch']);
+  const filters = pick(req.query as Record<string, unknown>, [
+    'courseId',
+    'batchTime',
+    'hscBatch',
+  ]);
   const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
   const result = await AttendanceService.getTodayAttendanceFromDB({
     ...filters,

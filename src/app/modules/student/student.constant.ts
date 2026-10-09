@@ -16,7 +16,6 @@ export const studentFilterableFields = [
   'classTime',
   'scenarioCourses',
   'hasDue',
-  'activeCoursesOnly',
   // Free-vs-paid segregation. `true` → marketer roster on
   // /dashboard/free-students; `false` → paid dashboard default on
   // /dashboard/students. Without this entry the controller's
@@ -32,11 +31,17 @@ export const studentFilterableFields = [
 ];
 
 // `user.studentId` was removed when we migrated the canonical login
-// handle to mobile. The per-enrollment `studentCourse.studentCourseId`
-// is the printable handle on receipts, not a single global string on
-// User — so it doesn't make sense to search by it here. Admins search
-// by name / nickname / mobile, all of which are surfaced on the
-// students list.
-export const studentSearchableFields = ['user.name', 'user.nickname', 'mobile'];
+// handle to mobile, but the per-enrollment printable handle
+// (`StudentCourse.studentCourseId`, e.g. "271200") is still surfaced
+// on the Students list and the SMS picker, so admins expect to
+// search by it. We resolve it through the `studentCourses` relation
+// in the service's OR-clause (see student.service.ts `searchTerm`
+// branch in getAllStudentsFromDB).
+export const studentSearchableFields = [
+  'user.name',
+  'user.nickname',
+  'mobile',
+  'studentCourses.studentCourseId',
+];
 
 export { paginationFields } from '../../constant/pagination';

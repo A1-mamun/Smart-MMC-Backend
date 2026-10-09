@@ -7,11 +7,13 @@ import dayjs from 'dayjs';
 import { SettingsService } from './settings.service';
 import { AbsentWarningService } from '../absentWarning/absentWarning.service';
 import { ExamAbsenceWarningService } from '../examAbsenceWarning/examAbsenceWarning.service';
+import { AttendanceService } from '../attendance/attendance.service';
 /* eslint-enable @typescript-eslint/no-unused-vars, no-unused-vars */
 import config from '../../config';
 
 let absentTask: ScheduledTask | null = null;
 let examTask: ScheduledTask | null = null;
+let attendanceAbsentTask: ScheduledTask | null = null;
 
 // In-process "fired-this-minute" latches so a slow tick cannot double-fire
 // within the same minute window. We deliberately do NOT persist these —
@@ -20,6 +22,8 @@ let examTask: ScheduledTask | null = null;
 let absentLastFiredKey = '';
 /* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
 let examLastFiredKey = '';
+/* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
+let attendanceAbsentLastFiredKey = '';
 
 /**
  * Start BOTH cron-backed schedulers.
@@ -31,20 +35,60 @@ let examLastFiredKey = '';
  *   2. **exam-absence** — fires once per day at the configured
  *      (hour, minute) and processes every absent examinee whose exam
  *      was `delayDays` ago.
+ *   3. **attendance-absent** — fires every minute, scans every
+ *      BatchDay row whose [start time + durationMinutes] finished in
+ *      the last minute, and inserts an `Attendance` row with
+ *      `status = ABSENT` for every enrolled student who did NOT
+ *      check in. Idempotent via the `(studentId, date)` unique
+ *      index + `createMany({ skipDuplicates: true })`. Always on.
  *
  * DISABLED 2026-10-01 per user request: automatic SMS sending is
- * temporarily turned off. Both cron tasks below are preserved inside
- * the comment block for easy re-enable. The exports (`startAllSchedulers`,
- * `startAbsentWarningScheduler`, `stopAllSchedulers`,
- * `stopAbsentWarningScheduler`) stay live as no-ops so server.ts and
- * any tooling keep working.
+ * temporarily turned off. Both SMS-sending cron tasks below are
+ * preserved inside the comment block for easy re-enable. The
+ * attendance-absent marker is a separate concern from SMS and stays
+ * LIVE — admins need the ABSENT rows to land even when SMS is parked.
+ * The exports (`startAllSchedulers`, `startAbsentWarningScheduler`,
+ * `stopAllSchedulers`, `stopAbsentWarningScheduler`) stay live so
+ * server.ts and any tooling keep working.
  *
  * Skipped when `config.node_env === 'test'` so `pnpm build` and CI runs
  * don't drag in cron state.
  */
 export const startAllSchedulers = () => {
-  if (absentTask || examTask) return;
+  if (absentTask || examTask || attendanceAbsentTask) return;
   if (config.node_env === 'test') return;
+
+  // ----- attendance-absent tick (LIVE) -----
+  // Per-minute scan for finished slots. The AttendanceService entry
+  // point is internally idempotent — it checks for existing rows on
+  // each candidate before inserting, and uses `createMany({
+  // skipDuplicates: true })` so a slow tick + a fast restart cannot
+  // produce duplicates. The in-process fire latch below is just an
+  // optimisation to skip re-running the scan on a minute that the
+  // service has already processed.
+  attendanceAbsentTask = cron.schedule('* * * * *', async () => {
+    try {
+      // One tick per (BD-date, minute) window. dayjs without .tz()
+      // would interpret this in server-local TZ — the service itself
+      // re-anchors every date math to Asia/Dhaka, so the latch key
+      // is purely a "did we already run this minute" signal and
+      // any TZ framing is fine. Use UTC to be consistent with the
+      // other latches and avoid drift across server deploys.
+      const now = dayjs();
+      const fireKey = `att-abs:${now.format('YYYY-MM-DD-HH-mm')}`;
+      if (attendanceAbsentLastFiredKey === fireKey) return;
+      attendanceAbsentLastFiredKey = fireKey;
+
+      const result = await AttendanceService.markAbsenteesForFinishedSlotsToDB();
+      if (result.inserted > 0 || result.slots > 0) {
+        console.log(
+          `[attendance-absent] slots=${result.slots} scanned=${result.scanned} inserted=${result.inserted}`,
+        );
+      }
+    } catch (err) {
+      console.error('[attendance-absent scheduler]', err);
+    }
+  });
 
   // ----- absent-warning tick (DISABLED — preserved for re-enable) -----
   /*
@@ -113,16 +157,14 @@ export const startAllSchedulers = () => {
       }
     },
   );
-
-  console.log('Schedulers registered ✓ (absent-warning, exam-absence)');
   */
+
+  console.log('Schedulers registered ✓ (attendance-absent; auto-SMS parked)');
   void cron;
   void dayjs;
   void SettingsService;
-  // Auto-SMS is parked. Manual triggers via the /settings/* POST
-  // endpoints still work — they hit the no-op service stubs and
-  // return clean "0 sent" responses.
-  console.log('Schedulers parked ✓ (auto-SMS disabled per request)');
+  void AbsentWarningService;
+  void ExamAbsenceWarningService;
 };
 
 /**
@@ -142,8 +184,13 @@ export const stopAllSchedulers = () => {
     examTask.stop();
     examTask = null;
   }
+  if (attendanceAbsentTask) {
+    attendanceAbsentTask.stop();
+    attendanceAbsentTask = null;
+  }
   absentLastFiredKey = '';
   examLastFiredKey = '';
+  attendanceAbsentLastFiredKey = '';
 };
 
 /**

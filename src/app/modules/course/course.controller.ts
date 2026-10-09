@@ -18,13 +18,8 @@ const createCourse = catchAsync(async (req, res) => {
 });
 
 const getAllCourses = catchAsync(async (req, res) => {
-  const filters = pick(req.query as Record<string, unknown>, ['isActive', 'status', 'searchTerm']);
+  const filters = pick(req.query as Record<string, unknown>, ['status', 'searchTerm']);
   const paginationOptions = pick(req.query as Record<string, unknown>, paginationFields);
-  // Express query strings are always strings — coerce isActive manually.
-  if (filters.isActive !== undefined) {
-    if (filters.isActive === 'true') filters.isActive = true;
-    else if (filters.isActive === 'false') filters.isActive = false;
-  }
   const result = await CourseService.getAllCoursesFromDB({
     ...filters,
     ...paginationOptions,
@@ -75,19 +70,6 @@ const deleteCourse = catchAsync(async (req, res) => {
     success: true,
     message: 'Course deleted successfully',
     data: null,
-  });
-});
-
-const toggleActive = catchAsync(async (req, res) => {
-  const result = await CourseService.toggleCourseActiveToDB(
-    req.params.id as string,
-    req.body.isActive,
-  );
-  sendResponse(res, {
-    statusCode: httpStatus.OK,
-    success: true,
-    message: `Course ${result.isActive ? 'activated' : 'deactivated'} successfully`,
-    data: result,
   });
 });
 
@@ -191,7 +173,6 @@ export const CourseController = {
   getCourseSeats,
   updateCourse,
   deleteCourse,
-  toggleActive,
   setStatus,
   toggleAdmitAnotherCourse,
   toggleBatchSlot,

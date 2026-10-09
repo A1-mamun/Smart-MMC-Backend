@@ -1,8 +1,21 @@
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
 import AppError from '../../errors/AppError';
 import httpStatus from 'http-status';
 import { StudentService } from '../student/student.service';
 import { toIntl } from '../../utils/phone';
+// NOTE: When re-enabling the disabled auto-send block below, also
+// add `import { instituteLocalDate } from '../../utils/classDayCalendar';`
+// — the disabled code path uses it to anchor ISO date strings to the
+// BD calendar for safe @db.Date round-trips.
+
+// Extend tz-aware plugins for the `today` / `targetDate` helpers
+// below. classDayCalendar.ts also extends these, but absentWarning is
+// imported in isolation paths where classDayCalendar may not have
+// been loaded yet.
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 // The imports below are only used by the auto-send logic that is
 // temporarily disabled (see comment block at runAbsentWarningJobFromDB
@@ -55,8 +68,13 @@ void ABSENT_WARNING_MESSAGE;
  * admin can see why a row didn't make the cut.
  */
 const getAbsentPickerFromDB = async (params: { date: string }) => {
-  const targetDate = dayjs(params.date).startOf('day').toDate();
-  const today = dayjs().startOf('day').toDate();
+  // Both `targetDate` and `today` are anchored to Asia/Dhaka so they
+  // line up with the @db.Date column values the attendance service
+  // writes (which are also BD-anchored via the institute TZ helper).
+  // Without this, a UTC server can mis-classify the "is this a future
+  // date?" guard by up to a day around the BD midnight boundary.
+  const targetDate = dayjs.utc(params.date).tz('Asia/Dhaka').startOf('day').toDate();
+  const today = dayjs().tz('Asia/Dhaka').startOf('day').toDate();
   if (targetDate.getTime() > today.getTime()) {
     throw new AppError(
       httpStatus.BAD_REQUEST,
@@ -221,7 +239,13 @@ const runForTargets = async (
   const skippedNoFatherMobile: string[] = [];
 
   for (const isoDate of targetDates) {
-    const d = dayjs(isoDate).startOf('day').toDate();
+    // `isoDate` arrives as a YYYY-MM-DD string that the caller
+    // (auto-send scheduler or manual picker) has already anchored to
+    // BD. Re-shape to a UTC-midnight Date whose UTC date parts equal
+    // that BD-local day so the value we pass to Prisma's @db.Date
+    // column and to the cohort resolver's `absentOnDate` filter both
+    // round-trip correctly across server TZs.
+    const d = instituteLocalDate(new Date(`${isoDate}T00:00:00Z`));
     const cohort = await StudentService.getAllStudentsFromDB(
       { absentOnDate: d, limit: 1000, page: 1 },
       { page: 1, limit: 1000 },
