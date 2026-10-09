@@ -941,6 +941,54 @@ const getAllStudentsFromDB = async (
     prisma.student.count({ where }),
   ]);
 
+  // Per-student attendance summary for the Students list "Attendance %"
+  // column. Single round-trip via `groupBy({ by: ['studentId', 'status'] })`
+  // so the list page can show `(present / total) * 100` without doing N+1
+  // count queries. The (studentId, date) unique index keeps the underlying
+  // scan cheap; the groupBy planner uses the index on `studentId` and
+  // aggregates the status split in memory per student. We only fetch
+  // attendance for the IDs that are actually in the current page — the
+  // list is paginated, so the workload is bounded by `limit` (default
+  // 10, max 100) regardless of cohort size.
+  const studentIds = data.map((s) => s.id);
+  const attendanceByStudent: Record<
+    string,
+    { total: number; present: number; absent: number }
+  > = {};
+  if (studentIds.length > 0) {
+    // Wrapped in try/catch so a missing-column / enum-drift / type
+    // mismatch on the Attendance table degrades to "no attendance
+    // data" rather than 500ing the entire students list (which would
+    // hide every student from the dashboard). When the summary fails
+    // to compute, the `attendanceByStudent` map stays empty and each
+    // student renders as `total: 0` / "No data" on the list.
+    try {
+      const rows = await prisma.attendance.groupBy({
+        by: ['studentId', 'status'],
+        where: { studentId: { in: studentIds } },
+        _count: { _all: true },
+      });
+      for (const row of rows) {
+        const bucket =
+          (attendanceByStudent[row.studentId] ??= {
+            total: 0,
+            present: 0,
+            absent: 0,
+          });
+        const n = row._count._all;
+        bucket.total += n;
+        if (row.status === 'PRESENT') bucket.present += n;
+        else if (row.status === 'ABSENT') bucket.absent += n;
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[students] attendance groupBy failed; rendering list without summaries:',
+        err,
+      );
+    }
+  }
+
   // Derive a per-student paymentStatus from the persisted StudentCourse.status
   // values (NOT from a recomputation against fee/payments), so manual status
   // overrides — both historical and from the override-status field on
@@ -970,11 +1018,28 @@ const getAllStudentsFromDB = async (
       courseName: sc.course?.name ?? 'Course',
       status: sc.status as 'PENDING' | 'PARTIAL' | 'PAID',
     }));
+    // Pull the precomputed attendance split for this student (zero
+    // allocations if the student has no attendance rows). The
+    // percentage is rounded to the nearest integer so it fits cleanly
+    // inside the Students table cell; the raw counts are still on the
+    // wire so the details page can format them any way it likes.
+    const att = attendanceByStudent[s.id] ?? {
+      total: 0,
+      present: 0,
+      absent: 0,
+    };
+    const attendanceSummary = {
+      total: att.total,
+      present: att.present,
+      absent: att.absent,
+      percentage: att.total === 0 ? 0 : Math.round((att.present / att.total) * 100),
+    };
     return {
       ...s,
       paymentStatus: status,
       paymentSummary: { totalFee, totalPaid, totalDue },
       coursePaymentStatuses,
+      attendanceSummary,
     };
   });
 

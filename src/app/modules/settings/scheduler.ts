@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-vars, no-unused-vars */
 // The cron / absent / exam-absence imports below are only used by the
 // disabled auto-SMS code. Parked while the auto path is off; remove the
 // disable comment when re-enabling.
@@ -8,21 +7,17 @@ import { SettingsService } from './settings.service';
 import { AbsentWarningService } from '../absentWarning/absentWarning.service';
 import { ExamAbsenceWarningService } from '../examAbsenceWarning/examAbsenceWarning.service';
 import { AttendanceService } from '../attendance/attendance.service';
-/* eslint-enable @typescript-eslint/no-unused-vars, no-unused-vars */
 import config from '../../config';
 
-let absentTask: ScheduledTask | null = null;
+// let absentTask: ScheduledTask | null = null;
 let examTask: ScheduledTask | null = null;
 let attendanceAbsentTask: ScheduledTask | null = null;
 
 // In-process "fired-this-minute" latches so a slow tick cannot double-fire
 // within the same minute window. We deliberately do NOT persist these —
 // on process restart the scheduler resumes from the next minute slot.
-/* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
-let absentLastFiredKey = '';
-/* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
+// let absentLastFiredKey = '';
 let examLastFiredKey = '';
-/* eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars */
 let attendanceAbsentLastFiredKey = '';
 
 /**
@@ -55,7 +50,9 @@ let attendanceAbsentLastFiredKey = '';
  * don't drag in cron state.
  */
 export const startAllSchedulers = () => {
-  if (absentTask || examTask || attendanceAbsentTask) return;
+  // if (absentTask || examTask || attendanceAbsentTask) return;
+  if (examTask || attendanceAbsentTask) return;
+
   if (config.node_env === 'test') return;
 
   // ----- attendance-absent tick (LIVE) -----
@@ -121,43 +118,36 @@ export const startAllSchedulers = () => {
       }
     },
   );
+  */
 
   // ----- exam-absence tick (DISABLED — preserved for re-enable) -----
-  examTask = cron.schedule(
-    '* * * * *',
-    async () => {
-      try {
-        const cfg = (await SettingsService.getConfigFromDB()).examAbsence;
-        if (!cfg.enabled) return;
+  examTask = cron.schedule('* * * * *', async () => {
+    try {
+      const cfg = (await SettingsService.getConfigFromDB()).examAbsence;
+      if (!cfg.enabled) return;
 
-        const now = dayjs();
-        if (now.hour() !== cfg.hour) return;
-        if (now.minute() !== cfg.minute) return;
+      const now = dayjs();
+      if (now.hour() !== cfg.hour) return;
+      if (now.minute() !== cfg.minute) return;
 
-        const fireKey = `exam:${now.format('YYYY-MM-DD-HH-mm')}`;
-        if (examLastFiredKey === fireKey) return;
-        examLastFiredKey = fireKey;
+      const fireKey = `exam:${now.format('YYYY-MM-DD-HH-mm')}`;
+      if (examLastFiredKey === fireKey) return;
+      examLastFiredKey = fireKey;
 
-        // Single deterministic date — exam days are atomic, no window
-        // walk. The inner service handles cohort + dedupe via the
-        // `(examId, studentId)` unique index on ExamAbsenceWarning.
-        const targetDate = now.subtract(cfg.delayDays, 'day').startOf('day').toDate();
-        const result = await ExamAbsenceWarningService.runForDate(
-          targetDate,
-          'SYSTEM',
-          'SYSTEM',
+      // Single deterministic date — exam days are atomic, no window
+      // walk. The inner service handles cohort + dedupe via the
+      // `(examId, studentId)` unique index on ExamAbsenceWarning.
+      const targetDate = now.subtract(cfg.delayDays, 'day').startOf('day').toDate();
+      const result = await ExamAbsenceWarningService.runForDate(targetDate, 'SYSTEM', 'SYSTEM');
+      if (result.total > 0) {
+        console.log(
+          `[exam-absence] sent=${result.sent} skipped=${result.skipped} total=${result.total} exams=${result.examsProcessed.length}`,
         );
-        if (result.total > 0) {
-          console.log(
-            `[exam-absence] sent=${result.sent} skipped=${result.skipped} total=${result.total} exams=${result.examsProcessed.length}`,
-          );
-        }
-      } catch (err) {
-        console.error('[exam-absence scheduler]', err);
       }
-    },
-  );
-  */
+    } catch (err) {
+      console.error('[exam-absence scheduler]', err);
+    }
+  });
 
   console.log('Schedulers registered ✓ (attendance-absent; auto-SMS parked)');
   void cron;
@@ -173,13 +163,13 @@ export const startAllSchedulers = () => {
  * references) may still expect that name. New code should call
  * `startAllSchedulers`.
  */
-export const startAbsentWarningScheduler = startAllSchedulers;
+export const startAbsentScheduler = startAllSchedulers;
 
 export const stopAllSchedulers = () => {
-  if (absentTask) {
-    absentTask.stop();
-    absentTask = null;
-  }
+  // if (absentTask) {
+  //   absentTask.stop();
+  //   absentTask = null;
+  // }
   if (examTask) {
     examTask.stop();
     examTask = null;
@@ -188,7 +178,7 @@ export const stopAllSchedulers = () => {
     attendanceAbsentTask.stop();
     attendanceAbsentTask = null;
   }
-  absentLastFiredKey = '';
+  // absentLastFiredKey = '';
   examLastFiredKey = '';
   attendanceAbsentLastFiredKey = '';
 };
@@ -196,4 +186,4 @@ export const stopAllSchedulers = () => {
 /**
  * Backwards-compatible alias for the same reason as above.
  */
-export const stopAbsentWarningScheduler = stopAllSchedulers;
+export const stopAbsentScheduler = stopAllSchedulers;

@@ -504,7 +504,7 @@ const getStudentAttendanceFromDB = async (params: TGetStudentAttendance) => {
     };
   }
 
-  const [data, total] = await Promise.all([
+  const [data, total, presentAgg, absentAgg] = await Promise.all([
     prisma.attendance.findMany({
       where,
       skip,
@@ -512,14 +512,32 @@ const getStudentAttendanceFromDB = async (params: TGetStudentAttendance) => {
       orderBy: { [sortBy]: sortOrder },
     }),
     prisma.attendance.count({ where }),
+    // All-time present count, ignoring pagination and any active
+    // date filter. The Students-page "Attendance %" badge and the
+    // calendar details page both rely on the lifetime ratio, not
+    // the current page slice, so this MUST be the unbounded total.
+    prisma.attendance.count({
+      where: { studentId, status: 'PRESENT' },
+    }),
+    prisma.attendance.count({
+      where: { studentId, status: 'ABSENT' },
+    }),
   ]);
 
-  const presentCount = data.length;
+  const totalPresent = presentAgg;
+  const totalAbsent = absentAgg;
+  const totalAll = totalPresent + totalAbsent;
+  const percentage = totalAll === 0 ? 0 : Math.round((totalPresent / totalAll) * 100);
 
   return {
     data,
     meta: { page, limit, total },
-    summary: { totalPresent: presentCount },
+    summary: {
+      totalPresent,
+      totalAbsent,
+      total: totalAll,
+      percentage,
+    },
   };
 };
 
@@ -904,7 +922,7 @@ const markAbsenteesForFinishedSlotsToDB = async (): Promise<{
       // COMPLETE courses are "inactive" by lifecycle — the
       // absent-marking cron should never stamp rows for a
       // course that's already graduated.
-      course: { isDeleted: false, status: { not: 'COMPLETE' } },
+      course: { isDeleted: false, status: 'ONGOING' },
     },
     select: {
       id: true,

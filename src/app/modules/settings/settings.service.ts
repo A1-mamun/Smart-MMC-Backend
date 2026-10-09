@@ -1,13 +1,14 @@
+/* eslint-disable no-unused-vars */
 import { JwtPayload } from 'jsonwebtoken';
 import prisma from '../../utils/prisma';
 import { clearCacheByPattern } from '../../utils/clearCache';
 import {
-  DEFAULT_ABSENT_WARNING_CONFIG,
+  // DEFAULT_ABSENT_WARNING_CONFIG,
   DEFAULT_EXAM_ABSENCE_CONFIG,
   TConfigPatch,
   TExamAbsenceConfig,
   TSettingsConfig,
-  absentWarningConfigSchema,
+  // absentWarningConfigSchema,
   examAbsenceConfigSchema,
 } from './settings.validation';
 
@@ -36,19 +37,17 @@ const readSubConfig = async <T>(
  * surface a 500 instead of silently returning bad data).
  */
 const getConfigFromDB = async (): Promise<TSettingsConfig> => {
-  const [absent, exam] = await Promise.all([
-    readSubConfig(
-      ABSENT_WARNING_CONFIG_KEY,
-      absentWarningConfigSchema,
-      DEFAULT_ABSENT_WARNING_CONFIG,
-    ),
-    readSubConfig(
-      EXAM_ABSENCE_CONFIG_KEY,
-      examAbsenceConfigSchema,
-      DEFAULT_EXAM_ABSENCE_CONFIG,
-    ),
+  // const [absent, exam] = await Promise.all([
+  const [exam] = await Promise.all([
+    // readSubConfig(
+    //   ABSENT_WARNING_CONFIG_KEY,
+    //   absentWarningConfigSchema,
+    //   DEFAULT_ABSENT_WARNING_CONFIG,
+    // ),
+    readSubConfig(EXAM_ABSENCE_CONFIG_KEY, examAbsenceConfigSchema, DEFAULT_EXAM_ABSENCE_CONFIG),
   ]);
-  return { absentWarning: absent, examAbsence: exam };
+  // return { absentWarning: absent, examAbsence: exam };
+  return { examAbsence: exam };
 };
 
 /**
@@ -158,10 +157,7 @@ export const SettingsService = {
 
 // Re-export the validation-side helpers so callers (scheduler, examAbsence
 // service) can keep one consistent import path.
-export {
-  DEFAULT_ABSENT_WARNING_CONFIG,
-  DEFAULT_EXAM_ABSENCE_CONFIG,
-} from './settings.validation';
+export { DEFAULT_ABSENT_WARNING_CONFIG, DEFAULT_EXAM_ABSENCE_CONFIG } from './settings.validation';
 export type {
   TAbsentWarningConfig,
   TExamAbsenceConfig,

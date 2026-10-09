@@ -59,9 +59,7 @@ export const examAbsenceConfigSchema = z.object({
  * with already-deployed clients that still issue a GET against this
  * key. We accept ANY value here and the service code never reads it.
  */
-export const absentWarningConfigSchema = z
-  .object({})
-  .passthrough();
+export const absentWarningConfigSchema = z.object({}).passthrough();
 
 /**
  * PATCH-shaped upsert: every field optional, server merges with the
@@ -115,7 +113,7 @@ export const DEFAULT_EXAM_ABSENCE_CONFIG: TExamAbsenceConfig = {
  * this same envelope.
  */
 export type TSettingsConfig = {
-  absentWarning: TAbsentWarningConfig;
+  // absentWarning: TAbsentWarningConfig;
   examAbsence: TExamAbsenceConfig;
 };
 
