@@ -15,6 +15,8 @@ import { SettingsRoutes } from '../modules/settings/settings.route';
 import { AbsentWarningRoutes } from '../modules/absentWarning/absentWarning.route';
 import { FreeClassRoutes } from '../modules/freeClass/freeClass.route';
 import { FreeClassAdminRoutes } from '../modules/freeClass/freeClass.admin.route';
+import { BannerRoutes } from '../modules/banner/banner.route';
+import { SuccessStudentRoutes } from '../modules/successStudent/successStudent.route';
 
 const router = Router();
 
@@ -39,6 +41,12 @@ const moduleRoutes = [
   // /free-class prefix keeps the related routes grouped in OpenAPI /
   // Postman. The admin handler enforces SUPER_ADMIN/ADMIN roles itself.
   { path: '/free-class/admin', route: FreeClassAdminRoutes },
+  // Dynamic landing-page banner. Public GET (cached), admin POST/DELETE.
+  { path: '/banner', route: BannerRoutes },
+  // "Hall of Fame" success-student grid on the landing page.
+  // Public GET (cached 60s), admin POST/DELETE. Reuses the banner
+  // module's Cloudinary config (same preset + folder).
+  { path: '/success-student', route: SuccessStudentRoutes },
 ];
 
 moduleRoutes.forEach((r) => router.use(r.path, r.route));

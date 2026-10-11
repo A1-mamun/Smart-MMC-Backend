@@ -5,6 +5,7 @@ import { PaymentService } from './payment.service';
 import pick from '../../utils/pick';
 import { paginationFields } from '../../constant/pagination';
 import { JwtPayload } from 'jsonwebtoken';
+import { assertStudentOwnership } from '../../utils/assertStudentOwnership';
 
 const recordPayment = catchAsync(async (req, res) => {
   const result = await PaymentService.recordPaymentToDB(req.body, req.user as JwtPayload);
@@ -56,6 +57,12 @@ const getDuePayments = catchAsync(async (req, res) => {
 });
 
 const getStudentPayments = catchAsync(async (req, res) => {
+  // IDOR guard: a STUDENT-role JWT can only read its own payment
+  // history. Without this, any logged-in student could pass
+  // `/payment/student/<any-uuid>` and read someone else's records.
+  const user = req.user as JwtPayload & { userId: string; role: string };
+  await assertStudentOwnership(user.role, user.userId, req.params.studentId as string);
+
   const result = await PaymentService.getStudentPaymentsFromDB(req.params.studentId as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,

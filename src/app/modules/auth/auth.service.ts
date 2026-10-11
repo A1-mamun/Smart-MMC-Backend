@@ -29,8 +29,19 @@ const signInUserToDB = async (payload: TLogin) => {
 
   const user = await prisma.user.findUnique({ where: { mobile } });
 
+  // User-enumeration defense: collapse the "no such user" and "wrong
+  // password" cases into a single generic 401 "Invalid credentials"
+  // response. Returning distinct 404 vs 401 codes lets an attacker
+  // enumerate which mobile numbers have accounts (the `authRateLimiter`
+  // slows this down but doesn't make it impossible).
   if (!user) {
-    throw new AppError(httpStatus.NOT_FOUND, 'No account found with this mobile');
+    // Still burn a bcrypt round so timing can't tell the "no user"
+    // path from the "user, wrong password" path.
+    await bcrypt.compare(
+      payload.password,
+      '$2b$12$0000000000000000000000000000000000000000000000000000',
+    );
+    throw new AppError(httpStatus.UNAUTHORIZED, 'Invalid credentials');
   }
   if (user.isDeleted) {
     throw new AppError(httpStatus.FORBIDDEN, 'This account has been deleted');
@@ -171,31 +182,37 @@ const forgotPasswordToDB = async (payload: TForgotPassword) => {
     throw new AppError(httpStatus.BAD_REQUEST, 'Mobile is required');
   }
 
+  // Generic response regardless of whether the user exists — the
+  // return value below is identical in both cases so the endpoint
+  // can't be used to enumerate which mobile numbers have accounts.
+  // `passwordResetRateLimiter` (3/hr per IP) is the only thing
+  // slowing the attack; this collapses the second signal.
   const user = await prisma.user.findUnique({ where: { mobile } });
-  if (!user) throw new AppError(httpStatus.NOT_FOUND, 'No user found');
 
-  const token = generateResetToken();
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  if (user) {
+    const token = generateResetToken();
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
-  await prisma.passwordResetRequest.create({
-    data: {
-      userId: user.id,
-      token,
-      expiresAt,
-    },
-  });
+    await prisma.passwordResetRequest.create({
+      data: {
+        userId: user.id,
+        token,
+        expiresAt,
+      },
+    });
 
-  const resetLink = `${config.frontendUrls?.split(',')[0] || 'http://localhost:3000'}/reset-password?token=${token}`;
+    const resetLink = `${config.frontendUrls?.split(',')[0] || 'http://localhost:3000'}/reset-password?token=${token}`;
 
-  // `to` takes `user.mobile` as a stand-in for an email address. We
-  // never had email on file for students, so the mobile number is the
-  // best-effort identifier. (In a real production deployment, swap
-  // this for a proper email column.)
-  await sendEmail({
-    to: user.mobile,
-    subject: 'Reset your Smart MMC password',
-    html: `<p>Hello ${user.name},</p><p>Click the link below to reset your password (valid for 1 hour):</p><p><a href="${resetLink}">${resetLink}</a></p>`,
-  }).catch(() => undefined);
+    // `to` takes `user.mobile` as a stand-in for an email address. We
+    // never had email on file for students, so the mobile number is the
+    // best-effort identifier. (In a real production deployment, swap
+    // this for a proper email column.)
+    await sendEmail({
+      to: user.mobile,
+      subject: 'Reset your Smart MMC password',
+      html: `<p>Hello ${user.name},</p><p>Click the link below to reset your password (valid for 1 hour):</p><p><a href="${resetLink}">${resetLink}</a></p>`,
+    }).catch(() => undefined);
+  }
 
   return { message: 'If an account exists, a reset link has been sent.' };
 };

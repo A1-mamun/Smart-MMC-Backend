@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+
+# Development image for the backend. Single stage — there's no
+# production-like build artefact to ship; `tsx watch` (the `dev`
+# script in package.json) compiles TypeScript on the fly and
+# restarts on file changes.
+#
+# Source layout at runtime:
+#   - /app/src        ← bind-mount from host, edits reload instantly
+#   - /app/prisma     ← bind-mount from host, schema changes
+#                       trigger a tsx restart (not a re-generate;
+#                       run `npx prisma generate` manually if you
+#                       change the schema)
+#   - /app/node_modules  ← anonymous named volume, never overwritten
+#                          by the host's node_modules (which has
+#                          platform-specific binaries)
+#
+# This file is intentionally simple. Anything that's a "production
+# concern" (multi-stage builds, tsc, dist/, prisma migrate deploy)
+# lives in the prod Dockerfile.
+
+FROM node:22-alpine
+RUN corepack enable
+WORKDIR /app
+
+COPY package.json pnpm-lock.yaml ./
+COPY prisma ./prisma
+# Same lesson as the frontend: only `src/` and `prisma/` are
+# bind-mounted. tsconfig.json (with path aliases) and eslint
+# config need to be in the image so tsx picks them up.
+COPY tsconfig.json ./
+COPY eslint.config.mjs ./
+
+# `--ignore-scripts` skips ALL postinstall hooks during install
+# (the same trick the production Dockerfile uses to avoid pnpm 12+
+# `ERR_PNPM_IGNORED_BUILDS` — which blocks lifecycle scripts for
+# bcrypt, esbuild, @prisma/client, etc. unless they're explicitly
+# allow-listed). The dev container needs the Prisma client just as
+# much as the prod one does, so we run `prisma generate` explicitly
+# right after install. (tsx compiles on the fly, so we don't need
+# any other build step.)
+RUN pnpm install --frozen-lockfile --ignore-scripts
+RUN npx prisma generate
+
+# `pnpm dev` → `tsx watch src/server.ts` per package.json.
+# tsx watch restarts on every change to a TypeScript file in src/.
+CMD ["pnpm", "dev"]

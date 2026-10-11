@@ -16,7 +16,12 @@ const Auth = (...requiredRole: TUserRole[]) => {
 
     let decoded: JwtPayload;
     try {
-      decoded = jwt.verify(token, config.jwtAccessSecret as string) as JwtPayload;
+      // Pin the algorithm to HS256. jsonwebtoken >= 9 already rejects
+      // `alg: "none"`, but pinning here is a defense-in-depth measure
+      // that doesn't rely on library defaults.
+      decoded = jwt.verify(token, config.jwtAccessSecret as string, {
+        algorithms: ['HS256'],
+      }) as JwtPayload;
     } catch (error: unknown) {
       const err = error as { name?: string };
       if (err?.name === 'TokenExpiredError') {

@@ -28,7 +28,12 @@ export type TJwtPayload = {
 export const generateAccessToken = (
   payload: Omit<TJwtPayload, 'iat' | 'exp'>,
 ): string => {
+  // Pin the algorithm to HS256 explicitly. jsonwebtoken v9 already
+  // rejects `alg: "none"`, but we don't want our security to depend on
+  // a library default that could change in a future upgrade. Pinning
+  // here means a future bump can't silently widen the accepted set.
   return jwt.sign(payload, config.jwtAccessSecret as string, {
+    algorithm: 'HS256',
     expiresIn: config.jwtAccessExpiresIn,
   } as jwt.SignOptions);
 };
@@ -43,13 +48,19 @@ export const generateRefreshToken = (
     { ...payload, jti: crypto.randomUUID() },
     config.jwtRefreshSecret as string,
     {
+      algorithm: 'HS256',
       expiresIn: config.jwtRefreshExpiresIn,
     } as jwt.SignOptions,
   );
 };
 
 export const verifyRefreshToken = (token: string): TJwtPayload => {
-  return jwt.verify(token, config.jwtRefreshSecret as string) as TJwtPayload;
+  // Pin the algorithm on verify too, so a token claiming a different
+  // algorithm (e.g. RS256 with our HS256 secret as the public key —
+  // the classic alg-confusion attack) is rejected up front.
+  return jwt.verify(token, config.jwtRefreshSecret as string, {
+    algorithms: ['HS256'],
+  }) as TJwtPayload;
 };
 
 export const generateResetToken = (): string => {

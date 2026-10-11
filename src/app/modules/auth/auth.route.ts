@@ -4,7 +4,11 @@ import { AuthController } from './auth.controller';
 import { AuthValidation } from './auth.validation';
 import Auth from '../../middlewares/auth';
 import { USER_ROLE } from '../../constant/userConstant';
-import { authRateLimiter, passwordResetRateLimiter } from '../../middlewares/rateLimiter';
+import {
+  authRateLimiter,
+  passwordResetRateLimiter,
+  refreshTokenRateLimiter,
+} from '../../middlewares/rateLimiter';
 
 const router = express.Router();
 
@@ -17,6 +21,7 @@ router.post(
 
 router.post(
   '/refresh-token',
+  refreshTokenRateLimiter,
   validateRequest(AuthValidation.refreshTokenValidationSchema),
   AuthController.refreshToken,
 );

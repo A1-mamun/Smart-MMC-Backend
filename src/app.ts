@@ -10,6 +10,7 @@ import notFound from './app/middlewares/notFound';
 import morganMiddleware from './app/utils/morgan';
 import logger from './app/utils/logger';
 import config from './app/config';
+import { globalRateLimiter } from './app/middlewares/rateLimiter';
 
 const app = express();
 
@@ -32,6 +33,15 @@ app.use(
 
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
+
+// Mount the global rate limiter BEFORE per-route limiters and
+// business logic so it caps the worst-case abuse per IP across the
+// whole API. Per-route limiters (authRateLimiter,
+// writeOperationRateLimiter, etc.) are tighter and still apply to
+// individual endpoints, but this one is the safety net for anything
+// not otherwise capped (e.g. an attacker hammering unauth'd
+// /auth/refresh-token trying to brute-force JWTs).
+app.use(globalRateLimiter);
 
 app.use((req, _res, next) => {
   req.id = uuidv4();
@@ -56,11 +66,12 @@ app.get('/', (_req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.status(httpStatus.OK).json({
-    success: true,
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
+  // Intentionally minimal — no uptime, timestamp, or version. The
+  // /health endpoint is unauthenticated and gives free recon info
+  // (when did the server last restart? which build is running?) to
+  // anyone fingerprinting the host. Load balancers and uptime
+  // monitors only need a 200.
+  res.status(httpStatus.OK).json({ success: true, status: 'ok' });
 });
 
 app.use(globalErrorHandler);

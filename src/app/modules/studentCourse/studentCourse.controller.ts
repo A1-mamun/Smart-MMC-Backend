@@ -3,6 +3,7 @@ import catchAsync from '../../utils/catchAsync';
 import sendResponse from '../../utils/sendResponse';
 import { StudentCourseService } from './studentCourse.service';
 import { JwtPayload } from 'jsonwebtoken';
+import { assertStudentOwnership } from '../../utils/assertStudentOwnership';
 
 const enrollStudent = catchAsync(async (req, res) => {
   const result = await StudentCourseService.enrollStudentToDB(req.body, req.user as JwtPayload);
@@ -28,6 +29,13 @@ const completeCourse = catchAsync(async (req, res) => {
 });
 
 const getStudentCourses = catchAsync(async (req, res) => {
+  // IDOR guard: a STUDENT-role JWT can only read its own enrollment
+  // list. Without this, any logged-in student could pass
+  // `/student-course/student/<any-uuid>` and see another student's
+  // courses, fees, and full enrollment history.
+  const user = req.user as JwtPayload & { userId: string; role: string };
+  await assertStudentOwnership(user.role, user.userId, req.params.studentId as string);
+
   const result = await StudentCourseService.getStudentCoursesFromDB(req.params.studentId as string);
   sendResponse(res, {
     statusCode: httpStatus.OK,

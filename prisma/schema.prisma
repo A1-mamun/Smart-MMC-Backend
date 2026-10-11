@@ -191,6 +191,8 @@ model User {
   examsPublished     Exam[]                 @relation("ExamPublishedBy")
   examResultsUpdated ExamResult[]           @relation("ExamResultUpdatedBy")
   settingsUpdated    Setting[]              @relation("SettingUpdatedBy")
+  bannersCreated     Banner[]               @relation("BannerCreatedBy")
+  successStudentsCreated SuccessStudent[]   @relation("SuccessStudentCreatedBy")
   coursesCompleted   Course[]               @relation("CourseCompletedBy")
 
   // ─── Index strategy ─────────────────────────────────────────────────────
@@ -868,4 +870,54 @@ model FreeContentView {
   @@index([studentId])
   @@index([lastViewedAt])
   @@map("free_content_views")
+}
+
+// ─── Banner (dynamic landing-page hero) ────────────────────────────────────
+// Admin or super admin uploads an image (and optional caption). The
+// image is stored in Cloudinary; the `imageUrl` is the secure_url
+// returned by Cloudinary, and `publicId` is what we hand back to
+// Cloudinary's destroy endpoint when the admin deletes the row. The
+// public list endpoint orders by `createdAt DESC` so the most recently
+// uploaded banner shows first.
+model Banner {
+  id          String   @id @default(uuid())
+  imageUrl    String
+  publicId    String
+  caption     String?
+  createdById String
+  createdBy   User     @relation("BannerCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([createdAt])
+  @@map("banners")
+}
+
+// ─── Success Student (admin-curated "Hall of Fame") ─────────────────────
+// Drives the public landing page's success-stories grid. Admins add
+// each alumnus with a photo, name, the institute they got into, and
+// the batch they belonged to. The photo is stored on Cloudinary;
+// `imageUrl` is the secure_url, `publicId` is what the destroy call
+// takes on delete. The public list is ordered createdAt DESC so the
+// most recently added alumnus shows first.
+//
+// `batch` is stored as the display string ("Batch 25") rather than
+// the `HscBatch` enum because legacy batches (BATCH_23, BATCH_24) are
+// outside the enum's current range (BATCH_25..BATCH_28). The enum
+// would force admins to round-trip through enum-mapping for every
+// past alumnus, and the value is purely informational here.
+model SuccessStudent {
+  id          String   @id @default(uuid())
+  name        String   @db.VarChar(100)
+  institute   String   @db.VarChar(150)
+  batch       String   @db.VarChar(50)
+  imageUrl    String
+  publicId    String
+  createdById String
+  createdBy   User     @relation("SuccessStudentCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([createdAt])
+  @@map("success_students")
 }

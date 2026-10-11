@@ -9,12 +9,26 @@ import config from '../../config';
 import AppError from '../../errors/AppError';
 import httpStatus from 'http-status';
 import catchAsync from '../../utils/catchAsync';
+import { timingSafeEqual } from 'crypto';
 
 const router = express.Router();
 
 const requireDeviceSecret = catchAsync(async (req, _res, next) => {
   const secret = req.headers['x-device-secret'];
-  if (!secret || secret !== config.deviceSecret) {
+  const expected = config.deviceSecret;
+  // `timingSafeEqual` requires equal-length buffers, so we still need
+  // a length check — but we do the comparison itself in constant time
+  // so an attacker can't recover the secret one byte at a time by
+  // measuring how long a wrong-but-prefix-matching secret takes to
+  // reject. (Plain `!==` short-circuits on the first mismatched
+  // byte.)
+  if (
+    !secret ||
+    typeof secret !== 'string' ||
+    !expected ||
+    secret.length !== expected.length ||
+    !timingSafeEqual(Buffer.from(secret), Buffer.from(expected))
+  ) {
     throw new AppError(httpStatus.UNAUTHORIZED, 'Invalid device secret');
   }
   next();

@@ -6,6 +6,7 @@ import pick from '../../utils/pick';
 import { paginationFields } from '../../constant/pagination';
 import { JwtPayload } from 'jsonwebtoken';
 import { TGetStudentAttendance } from './attendance.validation';
+import { assertStudentOwnership } from '../../utils/assertStudentOwnership';
 
 const checkIn = catchAsync(async (req, res) => {
   const result = await AttendanceService.checkInStudentToDB(req.body);
@@ -48,6 +49,13 @@ const getToday = catchAsync(async (req, res) => {
 });
 
 const getStudentAttendance = catchAsync(async (req, res) => {
+  // IDOR guard: a STUDENT-role JWT can only read its own attendance
+  // history. Without this, any logged-in student could pass
+  // `/attendance/student/<any-uuid>` and see another student's full
+  // presence/absence timeline.
+  const user = req.user as JwtPayload & { userId: string; role: string };
+  await assertStudentOwnership(user.role, user.userId, req.params.studentId as string);
+
   const result = await AttendanceService.getStudentAttendanceFromDB(
     req as unknown as TGetStudentAttendance,
   );

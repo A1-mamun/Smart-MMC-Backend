@@ -37,6 +37,18 @@ export const passwordResetRateLimiter: RateLimitRequestHandler = rateLimit({
   legacyHeaders: false,
 });
 
+// Tighter cap on the refresh-token endpoint. The endpoint accepts an
+// arbitrary refreshToken in the body and runs jwt.verify on it; without
+// a per-IP limit an attacker can hammer it at line speed trying to
+// brute-force a valid signature. 20/min is plenty for a real client
+// doing normal rotation and makes brute-forcing impractical.
+export const refreshTokenRateLimiter: RateLimitRequestHandler = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+});
+
 // Tighter cap on free-class signup so the public form isn't abused to
 // spam the User/Student tables. 5/hr is plenty for a real student retrying
 // after a network blip.

@@ -261,7 +261,7 @@ async function main() {
           data: {
             fee: new Prisma.Decimal(course.fee),
             description: course.description,
-            isActive: true,
+            // isActive: true,
             hscBatch: course.hscBatch,
             status: course.status,
             // Gate follows status, same as setStatusToDB:
@@ -279,7 +279,7 @@ async function main() {
             fee: new Prisma.Decimal(course.fee),
             description: course.description,
             hscBatch: course.hscBatch,
-            isActive: true,
+            // isActive: true,
             status: course.status,
             isAllowAdmitAnotherCourse: course.status === 'COMPLETE',
             totalSeats: course.totalSeats,

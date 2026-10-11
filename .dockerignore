@@ -1,0 +1,28 @@
+# Local dev artifacts that should never end up in the image.
+node_modules
+dist
+logs
+coverage
+Dockerfile
+Dockerfile.*
+
+# Local env files — secrets must come from `env_file` in compose, not
+# be baked into the image.
+.env
+.env.local
+.env.*.local
+
+# Prisma client is generated inside the image at build time; the
+# on-disk cache is irrelevant and just bloats the build context.
+prisma/.cache
+
+# Log + OS noise.
+*.log
+.DS_Store
+.git
+.gitignore
+
+# Editor / OS metadata.
+.vscode
+.idea
+*.swp

@@ -31,7 +31,11 @@ const getAllActivities = catchAsync(async (req, res) => {
 });
 
 const getRecent = catchAsync(async (req, res) => {
-  const limit = Number(req.query.limit) || 10;
+  // Cap the page size so a client can't pull a million rows in one
+  // call (which would also be a slow query on a large activity log
+  // table). Anything above 100 is clamped to 100.
+  const requested = Number(req.query.limit) || 10;
+  const limit = Math.min(Math.max(requested, 1), 100);
   const result = await ActivityLogService.getRecentActivitiesFromDB(limit);
   sendResponse(res, {
     statusCode: httpStatus.OK,

@@ -73,15 +73,32 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next) => {
     errorSources = [{ path: '', message: err.message }];
   }
 
-  logger.error({
+  // 4xx errors are client-driven (bad input, auth failures, etc.) —
+  // their stacks are not actionable and can be large. We log them at
+  // `warn` without the stack. 5xx and unexpected errors get the full
+  // stack at `error`.
+  const isServerError = statusCode >= 500;
+  const logPayload = {
     statusCode,
     message,
     errorSources,
     method: req.method,
     url: req.originalUrl,
     ip: req.ip,
-    stack: err?.stack,
-  });
+  };
+  if (isServerError) {
+    logger.error({ ...logPayload, stack: err?.stack });
+  } else {
+    logger.warn(logPayload);
+  }
+
+  // Treat any value other than the literal string "development" as
+  // production. This is deliberately strict — `NODE_ENV=Development`
+  // (capital D) or `NODE_ENV=dev` would otherwise fall into the
+  // production branch by accident. We want the inverse failure mode:
+  // accidentally hiding dev detail is fine, accidentally leaking
+  // stack traces is not.
+  const isDev = config.node_env === 'development';
 
   res.status(statusCode).json({
     success: false,
@@ -90,11 +107,10 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next) => {
     // Dev-only debug metadata: surfaces the Prisma code/meta for the
     // catch-all handler so debugging "Invalid provider data" toasts
     // doesn't require tailing backend logs.
-    devDetail:
-      config.node_env === 'development'
-        ? (errorSources[0] as { _devDetail?: string })._devDetail ?? null
-        : null,
-    stack: config.node_env === 'development' ? err?.stack : null,
+    devDetail: isDev
+      ? (errorSources[0] as { _devDetail?: string })._devDetail ?? null
+      : null,
+    stack: isDev ? err?.stack : null,
   });
 };
 
