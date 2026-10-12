@@ -37,35 +37,48 @@ const batchTimeRegex = /^(0?[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$/i;
 
 const admitStudentSchema = z.object({
   body: z.object({
-    name: z.string().min(2).max(100),
-    nickname: z.string().max(50).optional(),
-    college: z.string().max(200).optional(),
+    // Only the truly load-bearing fields are required. The
+    // admission desk frequently takes students with incomplete
+    // profiles (walk-ins who can't recall their SSC institute,
+    // guardian info not on hand, etc.) — the rest can be filled
+    // in later from the student detail page.
+    name: z.string().trim().min(2).max(100),
+    nickname: z.string().max(50).optional().nullable().or(z.literal('')),
+    college: z.string().max(200).optional().nullable().or(z.literal('')),
     mobile: z.string().regex(phoneRegex, 'Invalid BD mobile number'),
-    // Optional — admins frequently admit students without yet having
-    // blood-group info on file.
     bloodGroup: z.enum(bloodGroups).optional().nullable(),
-    // Father block: required (name + occupation + mobile).
-    fatherName: z.string().min(2).max(100),
-    fatherOccupation: z.string().min(2).max(100),
-    fatherMobile: z.string().regex(phoneRegex, 'Invalid BD mobile number'),
-    // Mother block: optional — single-parent / missing-info households.
-    motherName: z.string().min(2).max(100).optional().nullable(),
-    motherOccupation: z.string().max(100).optional().nullable(),
+    // Father block — now optional. The field still goes through
+    // `nullIfEmpty` in the service so an empty string becomes a
+    // real `null` instead of polluting the DB with `""`.
+    fatherName: z.string().max(100).optional().nullable().or(z.literal('')),
+    fatherOccupation: z
+      .string()
+      .max(100)
+      .optional()
+      .nullable()
+      .or(z.literal('')),
+    fatherMobile: z
+      .string()
+      .regex(phoneRegex, 'Invalid BD mobile number')
+      .optional()
+      .nullable()
+      .or(z.literal('')),
+    // Mother block — was already optional.
+    motherName: z.string().max(100).optional().nullable().or(z.literal('')),
+    motherOccupation: z.string().max(100).optional().nullable().or(z.literal('')),
     motherMobile: z
       .string()
       .regex(phoneRegex, 'Invalid BD mobile number')
       .optional()
       .nullable()
       .or(z.literal('')),
-    // Address: only Upazila + District are required. Village / Post Office
-    // are common to be unknown at admit time (urban students especially).
+    // Address — was required (Upazila + District), now all optional.
     addressVillage: z.string().max(200).optional().nullable().or(z.literal('')),
     addressPostOffice: z.string().max(100).optional().nullable().or(z.literal('')),
-    addressUpozila: z.string().min(1).max(100),
-    addressDistrict: z.string().min(1).max(100),
-    // SSC: institute required; board / year / GPA often filled in later
-    // once the student brings their certificate / testimonial.
-    sscInstitute: z.string().min(1).max(200),
+    addressUpozila: z.string().max(100).optional().nullable().or(z.literal('')),
+    addressDistrict: z.string().max(100).optional().nullable().or(z.literal('')),
+    // SSC — was required (institute), now all optional.
+    sscInstitute: z.string().max(200).optional().nullable().or(z.literal('')),
     sscBoard: z.enum(boards).optional().nullable(),
     sscPassingYear: z.coerce
       .number()
@@ -75,13 +88,35 @@ const admitStudentSchema = z.object({
       .optional()
       .nullable(),
     sscGpa: z.coerce.number().min(0).max(5).optional().nullable(),
+    // Course / batch — still required (this is the admission itself).
     courseId: z.string().uuid('Select a course'),
     batchDayId: z.string().uuid('Select a batch day'),
     batchTime: z
       .string()
       .trim()
       .regex(batchTimeRegex, 'Time must be in "h:mm AM/PM" format (e.g. 7:00 AM)'),
-  }),
+    // PP (referral) linkage. Both fields optional — most students
+    // are admitted with no PP. Cross-field rule below: setting
+    // `ppFee` without a `ppId` is meaningless (a fee attached to
+    // nobody), so we reject that combination with a 400.
+    ppId: z.string().uuid('Invalid PP').optional().nullable(),
+    ppFee: z.coerce
+      .number()
+      .min(0, 'PP fee cannot be negative')
+      .max(10_000_000, 'PP fee looks too large; double-check the value')
+      .optional()
+      .nullable(),
+  })
+    .refine(
+      (d) => d.ppFee == null || d.ppFee === 0 || !!d.ppId,
+      {
+        // Setting a positive ppFee requires a PP id. A ppFee of
+        // 0 is allowed even without a ppId (it's a no-op, but
+        // the admin UI may have sent both fields as zero).
+        message: 'PP fee requires a PP to be selected',
+        path: ['ppFee'],
+      },
+    ),
 });
 
 /**
@@ -102,7 +137,24 @@ const enrollExistingStudentSchema = z.object({
     // Optional nickname fix-up — admins occasionally want to correct a
     // typo without going through the full edit-student flow.
     nickname: z.string().trim().min(1).max(50).optional(),
-  }),
+    // Optional PP linkage — admins may want to back-fill a referrer
+    // for a student who was originally admitted without one. Same
+    // cross-field rule: positive ppFee requires a ppId.
+    ppId: z.string().uuid('Invalid PP').optional().nullable(),
+    ppFee: z.coerce
+      .number()
+      .min(0, 'PP fee cannot be negative')
+      .max(10_000_000, 'PP fee looks too large; double-check the value')
+      .optional()
+      .nullable(),
+  })
+    .refine(
+      (d) => d.ppFee == null || d.ppFee === 0 || !!d.ppId,
+      {
+        message: 'PP fee requires a PP to be selected',
+        path: ['ppFee'],
+      },
+    ),
 });
 
 const updateStudentSchema = z.object({
@@ -135,7 +187,30 @@ const updateStudentSchema = z.object({
       .optional()
       .nullable(),
     sscGpa: z.coerce.number().min(0).max(5).optional().nullable(),
-  }),
+    // PP (referral) linkage. Same shape + cross-field rule as
+    // `admitStudentSchema` and `enrollExistingStudentSchema` —
+    // a positive `ppFee` requires a `ppId`; a null/zero `ppFee`
+    // is fine on its own (admin may want to attach a PP later
+    // without yet committing a fee). Edit form needs this so
+    // admins can back-fill or clear a PP after the initial
+    // admit.
+    ppId: z.string().uuid('Invalid PP').optional().nullable(),
+    ppFee: z.coerce
+      .number()
+      .min(0, 'PP fee cannot be negative')
+      .max(10_000_000, 'PP fee looks too large; double-check the value')
+      .optional()
+      .nullable(),
+  })
+    .refine(
+      (d) => d.ppFee == null || d.ppFee === 0 || !!d.ppId,
+      {
+        // Same cross-field rule as admit/enroll. A positive
+        // ppFee with no ppId would orphan the commission.
+        message: 'PP fee requires a PP to be selected',
+        path: ['ppFee'],
+      },
+    ),
   params: z.object({ id: z.string().uuid() }),
 });
 

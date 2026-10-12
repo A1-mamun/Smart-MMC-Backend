@@ -5,8 +5,13 @@ import { clearCacheByPattern } from '../../utils/clearCache';
 import {
   // DEFAULT_ABSENT_WARNING_CONFIG,
   DEFAULT_EXAM_ABSENCE_CONFIG,
+  DEFAULT_INSTRUCTOR_SECTION,
+  instructorSectionSchema,
   TConfigPatch,
   TExamAbsenceConfig,
+  TInstructorSection,
+  TInstructorSectionPatch,
+  TInstructorStat,
   TSettingsConfig,
   // absentWarningConfigSchema,
   examAbsenceConfigSchema,
@@ -14,6 +19,7 @@ import {
 
 export const ABSENT_WARNING_CONFIG_KEY = 'absent_warning_sms';
 export const EXAM_ABSENCE_CONFIG_KEY = 'exam_absence_sms';
+export const INSTRUCTOR_SECTION_CONFIG_KEY = 'instructor_section';
 
 /**
  * Helper that loads ONE sub-config with default fallback. We split this
@@ -150,9 +156,79 @@ const upsertConfigInDB = async (
   return getConfigFromDB();
 };
 
+/**
+ * Public read of the instructor-section config. Cached
+ * server-side for 60s; the PUT path clears the cache so a
+ * super-admin edit shows up on the landing page within one
+ * minute. Returns the schema-defaulted shape if the row has
+ * never been written — first deploy with no Setting row must
+ * still render the stats, not an empty grid.
+ */
+const getInstructorSectionFromDB = async (): Promise<TInstructorSection> => {
+  return readSubConfig(
+    INSTRUCTOR_SECTION_CONFIG_KEY,
+    instructorSectionSchema,
+    DEFAULT_INSTRUCTOR_SECTION,
+  );
+};
+
+/**
+ * Super-admin upsert for the instructor section. Mirrors
+ * `upsertConfigInDB`: validate the merged value, write the
+ * full row, then evict the public cache so the landing page
+ * re-renders.
+ *
+ * `quote` uses `.nullish()` semantics: a `null` or empty
+ * string CLEARS the stored quote (the landing page then omits
+ * the quote block entirely); to keep the current value,
+ * simply omit the field from the patch. We forward `null`
+ * through to the merge so the stored value is wiped, but
+ * never an empty string — we treat an empty string the same
+ * as `null` so the admin form can submit "" without us
+ * storing a meaningless blank.
+ */
+const upsertInstructorSectionInDB = async (
+  patch: TInstructorSectionPatch,
+  actor: JwtPayload,
+): Promise<TInstructorSection> => {
+  const { stats, quote } = patch;
+  const quoteTouched = quote !== undefined;
+  const statsTouched = stats !== undefined;
+
+  if (statsTouched || quoteTouched) {
+    const patchForMerge: { stats?: TInstructorStat[]; quote?: string | null } = {};
+    if (statsTouched) patchForMerge.stats = stats;
+    if (quoteTouched) {
+      // Empty string → store `null` (frontend renders nothing
+      // when the field is null). Non-empty → store verbatim.
+      const trimmed = (quote ?? '').trim();
+      patchForMerge.quote = trimmed === '' ? null : trimmed;
+    }
+
+    await upsertSubConfig(
+      INSTRUCTOR_SECTION_CONFIG_KEY,
+      patchForMerge,
+      DEFAULT_INSTRUCTOR_SECTION,
+      instructorSectionSchema,
+      actor,
+    );
+    // Evict the public landing-page cache so the next visitor
+    // sees the freshly-saved value. Cache middleware keys on
+    // the URL path; a broad pattern catches both the public
+    // read and any future admin reads.
+    await clearCacheByPattern(
+      'cache:/api/v1/settings/public/instructor-section*',
+    ).catch(() => undefined);
+  }
+
+  return getInstructorSectionFromDB();
+};
+
 export const SettingsService = {
   getConfigFromDB,
   upsertConfigInDB,
+  getInstructorSectionFromDB,
+  upsertInstructorSectionInDB,
 };
 
 // Re-export the validation-side helpers so callers (scheduler, examAbsence
@@ -161,5 +237,7 @@ export { DEFAULT_ABSENT_WARNING_CONFIG, DEFAULT_EXAM_ABSENCE_CONFIG } from './se
 export type {
   TAbsentWarningConfig,
   TExamAbsenceConfig,
+  TInstructorSection,
+  TInstructorStat,
   TSettingsConfig,
 } from './settings.validation';

@@ -54,10 +54,24 @@ enum CourseName {
   HSC_1ST_YEAR
   HSC_2ND_YEAR
   HSC_FINAL_PREPARATION
-  ADMISSION
+  ADVANCED_ADMISSION
+  ENGINEERING_AND_VARSITY_ADMISSION
 }
 
 enum PaymentMethod {
+  CASH
+  BKASH
+  NAGAD
+  BANK
+  OTHER
+}
+
+// Payout method for money going OUT of the centre to a PP
+// (referrer). Same value set as PaymentMethod today, but kept
+// as a separate enum so the two can diverge later — e.g. a
+// future Cheque / Wire method for PP payouts shouldn't force
+// the existing student-payments enum to grow alongside.
+enum PpPaymentMethod {
   CASH
   BKASH
   NAGAD
@@ -193,6 +207,8 @@ model User {
   settingsUpdated    Setting[]              @relation("SettingUpdatedBy")
   bannersCreated     Banner[]               @relation("BannerCreatedBy")
   successStudentsCreated SuccessStudent[]   @relation("SuccessStudentCreatedBy")
+  ppsCreated         Pp[]                  @relation("PpCreatedBy")
+  ppPaymentsMade     PpPayment[]           @relation("PpPaymentPaidBy")
   coursesCompleted   Course[]               @relation("CourseCompletedBy")
 
   // ─── Index strategy ─────────────────────────────────────────────────────
@@ -245,17 +261,24 @@ model Student {
   // re-admissions.
   mobile            String            @unique
   bloodGroup        BloodGroup?
-  fatherName        String
-  fatherOccupation  String
-  fatherMobile      String
+  // Father block + address upazila/district + SSC institute were
+  // previously required at the DB level. The admit form was
+  // relaxed so the desk can take walk-ins with incomplete
+  // profiles and back-fill later from the student detail page.
+  // Migration `20261012120000_student_admit_fields_nullable`
+  // dropped the NOT NULL constraints; columns are now nullable
+  // to match.
+  fatherName        String?
+  fatherOccupation  String?
+  fatherMobile      String?
   motherName        String?
   motherOccupation  String?
   motherMobile      String?
   addressVillage    String?
   addressPostOffice String?
-  addressUpozila    String
-  addressDistrict   String
-  sscInstitute      String
+  addressUpozila    String?
+  addressDistrict   String?
+  sscInstitute      String?
   sscBoard          EducationBoard?
   sscPassingYear    Int?
   sscGpa            Decimal?          @db.Decimal(4, 2)
@@ -272,6 +295,15 @@ model Student {
   freeUpazila       String?
   admittedAt        DateTime          @default(now())
   admittedBy        String
+  // ─── PP (referral) linkage ─────────────────────────────────────────
+  // Optional. `ppId` is the referrer this student was attributed to
+  // at admission time; `ppFee` is the per-student commission the
+  // centre owes that referrer for THIS student. Both nullable — most
+  // students have no PP. Server validates: ppFee > 0 ⇒ ppId must
+  // be set. ON DELETE SET NULL on the FK so a PP being soft- or
+  // hard-deleted never orphans a Student row.
+  ppId              String?
+  ppFee             Decimal?          @db.Decimal(10, 2)
   isDeleted         Boolean           @default(false)
   deletedAt         DateTime?
   deletedBy         String?
@@ -280,9 +312,11 @@ model Student {
 
   user                 User                  @relation("UserStudent", fields: [userId], references: [id], onDelete: Cascade)
   admittedByUser       User                  @relation("AdmittedBy", fields: [admittedBy], references: [id])
+  pp                   Pp?                   @relation(fields: [ppId], references: [id], onDelete: SetNull)
   studentCourses       StudentCourse[]
   batches              StudentBatch[]
   payments             Payment[]
+  ppPayments           PpPayment[]
   attendance           Attendance[]
   examResults          ExamResult[]
   weeklyAbsentWarnings WeeklyAbsentWarning[]
@@ -295,6 +329,7 @@ model Student {
   @@index([isDeleted])
   @@index([isFreeAccount])
   @@index([intakeMode])
+  @@index([ppId])
   @@map("students")
 }
 
@@ -920,4 +955,57 @@ model SuccessStudent {
 
   @@index([createdAt])
   @@map("success_students")
+}
+
+// ─── PP (Referral) ─────────────────────────────────────────────────
+// Roster of referrers the admin can attach to a student at
+// admission. `name` is the only required field — phone / email /
+// address are out of scope; the centre works the PP informally.
+// Soft-delete via `isDeleted` (matching the rest of the schema) so
+// the audit trail of payouts is never lost when a PP is removed.
+model Pp {
+  id          String   @id @default(uuid())
+  name        String   @db.VarChar(100)
+  createdById String
+  createdBy   User     @relation("PpCreatedBy", fields: [createdById], references: [id])
+  isDeleted   Boolean  @default(false)
+  deletedAt   DateTime?
+  deletedBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  students  Student[]
+  payments  PpPayment[]
+
+  @@index([isDeleted])
+  @@index([name])
+  @@map("pps")
+}
+
+// Payout ledger — money paid out FROM the centre TO a PP. One row
+// per disbursement. Distinct from the existing `Payment` model
+// (which is money coming IN from students). When `studentId` is
+// set, the row is a per-student payout that contributes to that
+// student's "PP fee paid" total; when null, it's a lump sum that
+// simply reduces the PP's overall due.
+model PpPayment {
+  id        String          @id @default(uuid())
+  ppId      String
+  studentId String?
+  amount    Decimal         @db.Decimal(10, 2)
+  method    PpPaymentMethod
+  paidAt    DateTime        @default(now())
+  paidBy    String
+  note      String?         @db.VarChar(500)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  pp         Pp      @relation(fields: [ppId], references: [id], onDelete: Cascade)
+  student    Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  paidByUser User    @relation("PpPaymentPaidBy", fields: [paidBy], references: [id])
+
+  @@index([ppId])
+  @@index([studentId])
+  @@index([paidAt])
+  @@map("pp_payments")
 }

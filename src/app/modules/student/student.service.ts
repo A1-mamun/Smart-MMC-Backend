@@ -42,6 +42,11 @@ export type TEnrollExistingStudent = {
   batchDayId: string;
   batchTime: string;
   nickname?: string;
+  // PP back-fill on re-enrollment. Both optional — admins may
+  // re-enroll a student without touching the referrer linkage.
+  // Same nullability / validation rules as the admit schema.
+  ppId?: string | null;
+  ppFee?: number | null;
 };
 
 /**
@@ -133,6 +138,25 @@ const studentInclude = {
       amount: true,
       method: true,
       paidAt: true,
+    },
+  },
+  // PP (referral) linkage hydrated so the student detail page can
+  // render the PP sub-section without a follow-up query. The `pp`
+  // relation returns `null` when no PP is set (most students) or
+  // when the linked PP has been soft-deleted (the FK is `ON DELETE
+  // SET NULL`, so a soft-deleted PP also surfaces as null here).
+  // `ppPayments` is the per-student slice of the PP payout ledger —
+  // newest first so the table matches the natural reading order.
+  pp: {
+    select: {
+      id: true,
+      name: true,
+    },
+  },
+  ppPayments: {
+    orderBy: { paidAt: 'desc' },
+    include: {
+      paidByUser: { select: { id: true, name: true } },
     },
   },
 } satisfies Prisma.StudentInclude;
@@ -348,6 +372,24 @@ const enrollExistingStudentToDB = async (payload: TEnrollExistingStudent, user: 
       });
     }
 
+    // Optional PP back-fill: if the admin supplied ppId/ppFee on the
+    // re-enroll form, stamp them onto the existing student row. We
+    // don't compare to existingStudent.ppId because admins
+    // intentionally re-assign referrers sometimes (e.g. the original
+    // PP was a placeholder name); the new values always win.
+    if (payload.ppId !== undefined || payload.ppFee !== undefined) {
+      await tx.student.update({
+        where: { id: existingStudent.id },
+        data: {
+          ppId: payload.ppId ?? null,
+          ppFee:
+            payload.ppFee === undefined || payload.ppFee === null
+              ? null
+              : new Prisma.Decimal(payload.ppFee),
+        },
+      });
+    }
+
     await tx.activityLog.create({
       data: {
         actorId: user.userId,
@@ -452,6 +494,11 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
         courseId: payload.courseId,
         batchDayId: payload.batchDayId,
         batchTime: payload.batchTime,
+        // Forward PP linkage when re-admitting via the admit form.
+        // Same values land in the reuse branch's tx.student.update
+        // (added in the same diff).
+        ppId: payload.ppId,
+        ppFee: payload.ppFee,
       },
       user,
     );
@@ -510,17 +557,22 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
         // missing OR empty-string into a real `null` so the DB column
         // is cleanly nullable (instead of storing `""` everywhere).
         bloodGroup: nullIfEmpty(payload.bloodGroup),
-        fatherName: payload.fatherName,
-        fatherOccupation: payload.fatherOccupation,
-        fatherMobile: payload.fatherMobile,
+        // Father / address / SSC fields are now optional on the
+        // admit form. `nullIfEmpty` normalises missing/empty to a
+        // real `null` so the DB column stays cleanly nullable
+        // instead of being polluted with `""` from blank form
+        // submissions.
+        fatherName: nullIfEmpty(payload.fatherName) ?? '',
+        fatherOccupation: nullIfEmpty(payload.fatherOccupation) ?? '',
+        fatherMobile: nullIfEmpty(payload.fatherMobile) ?? '',
         motherName: nullIfEmpty(payload.motherName),
         motherOccupation: nullIfEmpty(payload.motherOccupation),
         motherMobile: nullIfEmpty(payload.motherMobile),
         addressVillage: nullIfEmpty(payload.addressVillage),
         addressPostOffice: nullIfEmpty(payload.addressPostOffice),
-        addressUpozila: payload.addressUpozila,
-        addressDistrict: payload.addressDistrict,
-        sscInstitute: payload.sscInstitute,
+        addressUpozila: nullIfEmpty(payload.addressUpozila) ?? '',
+        addressDistrict: nullIfEmpty(payload.addressDistrict) ?? '',
+        sscInstitute: nullIfEmpty(payload.sscInstitute) ?? '',
         sscBoard: nullIfEmpty(payload.sscBoard),
         sscPassingYear: nullIfEmpty(payload.sscPassingYear),
         // Decimal must be wrapped — guard against null/undefined before
@@ -530,6 +582,16 @@ const admitStudentToDB = async (payload: TAdmitStudent, user: JwtPayload) => {
             ? null
             : new Prisma.Decimal(payload.sscGpa),
         admittedBy: user.userId,
+        // PP (referral) linkage. Both nullable; validation has
+        // already enforced "positive ppFee ⇒ ppId must be set" so
+        // by the time we get here any non-null fee implies a
+        // non-null ppId. Decimal must be wrapped — same guard as
+        // sscGpa above.
+        ppId: payload.ppId ?? null,
+        ppFee:
+          payload.ppFee === undefined || payload.ppFee === null
+            ? null
+            : new Prisma.Decimal(payload.ppFee),
       },
     });
 
@@ -951,10 +1013,8 @@ const getAllStudentsFromDB = async (
   // list is paginated, so the workload is bounded by `limit` (default
   // 10, max 100) regardless of cohort size.
   const studentIds = data.map((s) => s.id);
-  const attendanceByStudent: Record<
-    string,
-    { total: number; present: number; absent: number }
-  > = {};
+  const attendanceByStudent: Record<string, { total: number; present: number; absent: number }> =
+    {};
   if (studentIds.length > 0) {
     // Wrapped in try/catch so a missing-column / enum-drift / type
     // mismatch on the Attendance table degrades to "no attendance
@@ -969,12 +1029,11 @@ const getAllStudentsFromDB = async (
         _count: { _all: true },
       });
       for (const row of rows) {
-        const bucket =
-          (attendanceByStudent[row.studentId] ??= {
-            total: 0,
-            present: 0,
-            absent: 0,
-          });
+        const bucket = (attendanceByStudent[row.studentId] ??= {
+          total: 0,
+          present: 0,
+          absent: 0,
+        });
         const n = row._count._all;
         bucket.total += n;
         if (row.status === 'PRESENT') bucket.present += n;
@@ -982,10 +1041,7 @@ const getAllStudentsFromDB = async (
       }
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error(
-        '[students] attendance groupBy failed; rendering list without summaries:',
-        err,
-      );
+      console.error('[students] attendance groupBy failed; rendering list without summaries:', err);
     }
   }
 
@@ -1131,6 +1187,21 @@ const updateStudentInDB = async (id: string, payload: TUpdateStudent['body'], us
     data.sscPassingYear = nullIfEmpty(payload.sscPassingYear);
   if (payload.sscGpa !== undefined) {
     data.sscGpa = payload.sscGpa === null ? null : new Prisma.Decimal(payload.sscGpa);
+  }
+  // PP (referral) linkage — mirrors the admit / enroll-existing
+  // patterns. Cross-field rule (positive ppFee requires ppId) is
+  // already enforced by `updateStudentSchema.refine` at the
+  // validation layer. `ppId` is a nullable FK (PP relation), so
+  // `null` clears the link; `ppFee` is a Decimal so it goes
+  // through `Prisma.Decimal` like the other money fields.
+  if (payload.ppId !== undefined) {
+    data.pp = payload.ppId ? { connect: { id: payload.ppId } } : { disconnect: true };
+  }
+  if (payload.ppFee !== undefined) {
+    data.ppFee =
+      payload.ppFee === null || payload.ppFee === undefined
+        ? null
+        : new Prisma.Decimal(payload.ppFee);
   }
 
   const result = await prisma.$transaction(async (tx) => {

@@ -9,6 +9,24 @@ import { writeOperationRateLimiter } from '../../middlewares/rateLimiter';
 
 const router = express.Router();
 
+/**
+ * Public read-only list of courses currently in ADMISSION. The
+ * landing page renders an "Admission batches" card grid off this
+ * endpoint so prospective students can see what's open without
+ * signing in. Returns only ADMISSION-status, non-deleted courses
+ * with their batch days (no PII, no per-slot seat counts). Cached
+ * for 60s; the admin write paths clear `/course*` so the landing
+ * page reflects a status flip within one minute.
+ *
+ * Mounted BEFORE the auth-protected routes so the public read
+ * never trips a JWT check.
+ */
+router.get(
+  '/public/admission',
+  cache(60),
+  CourseController.getPublicAdmissionCourses,
+);
+
 router.post(
   '/',
   Auth(USER_ROLE.SUPER_ADMIN),

@@ -12,7 +12,12 @@ const COURSE_NAME_TO_YEAR_DIGIT: Record<CourseName, string> = {
   HSC_1ST_YEAR: '1',
   HSC_2ND_YEAR: '2',
   HSC_FINAL_PREPARATION: '3',
-  ADMISSION: '4',
+  // `4` is reserved for ADVANCED_ADMISSION (was `ADMISSION` —
+  // legacy data had no ADMISSION rows, so the digit slots stay
+  // contiguous). ENGINEERING_AND_VARSITY_ADMISSION gets a 5th
+  // digit so it sorts after the existing tracks.
+  ADVANCED_ADMISSION: '4',
+  ENGINEERING_AND_VARSITY_ADMISSION: '5',
 };
 
 const STARTING_ROLL = 200;

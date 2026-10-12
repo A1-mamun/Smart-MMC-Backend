@@ -17,6 +17,7 @@ import { FreeClassRoutes } from '../modules/freeClass/freeClass.route';
 import { FreeClassAdminRoutes } from '../modules/freeClass/freeClass.admin.route';
 import { BannerRoutes } from '../modules/banner/banner.route';
 import { SuccessStudentRoutes } from '../modules/successStudent/successStudent.route';
+import { PpRoutes } from '../modules/pp/pp.route';
 
 const router = Router();
 
@@ -47,6 +48,10 @@ const moduleRoutes = [
   // Public GET (cached 60s), admin POST/DELETE. Reuses the banner
   // module's Cloudinary config (same preset + folder).
   { path: '/success-student', route: SuccessStudentRoutes },
+  // Referral / PP system: roster of referrers (admin-curated) and
+  // a payout ledger for money paid out to them. Distinct from
+  // /payment, which tracks money coming IN from students.
+  { path: '/pp', route: PpRoutes },
 ];
 
 moduleRoutes.forEach((r) => router.use(r.path, r.route));

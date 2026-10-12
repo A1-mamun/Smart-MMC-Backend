@@ -321,6 +321,7 @@ const checkInStudentToDB = async (payload: TCheckIn) => {
 };
 
 const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
+  // console.log('manualCheckInToDB', payload.studentId, user);
   const student = await prisma.student.findUnique({
     where: { id: payload.studentId },
     include: {
@@ -335,6 +336,8 @@ const manualCheckInToDB = async (payload: TManualCheckIn, user: JwtPayload) => {
       },
     },
   });
+
+  // console.log('manualCheckInToDB student', student);
 
   if (!student) throw new AppError(httpStatus.NOT_FOUND, 'Student not found');
 
@@ -930,6 +933,7 @@ const markAbsenteesForFinishedSlotsToDB = async (): Promise<{
       course: { select: { name: true } },
       times: true,
       durationMinutes: true,
+      slotStates: true,
     },
   });
 
@@ -943,6 +947,12 @@ const markAbsenteesForFinishedSlotsToDB = async (): Promise<{
       const startMin = parseTimeOfDay(slotTime);
       if (startMin === null) continue;
       const endMin = startMin + bd.durationMinutes;
+
+      // Skip slots the admin toggled off — slotStates is a parallel
+      // boolean array to bd.times, so index alignment is critical.
+      // A missing/false entry means the slot is off and we must
+      // not mark anyone absent for it.
+      if (bd.slotStates?.[slotIdx] === false) continue;
 
       // Slot finishes when its end crosses the now mark. The window
       // catches slots whose end is between (nowMinutes - 1) and

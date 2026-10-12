@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 const prisma = new PrismaClient();
 
 type DayName = string;
-type CourseName = 'HSC_1ST_YEAR' | 'HSC_2ND_YEAR' | 'HSC_FINAL_PREPARATION' | 'ADMISSION';
+type CourseName = 'HSC_1ST_YEAR' | 'HSC_2ND_YEAR' | 'HSC_FINAL_PREPARATION' | 'ADVANCED_ADMISSION' | 'ENGINEERING_AND_VARSITY_ADMISSION';
 type HscBatch = 'BATCH_25' | 'BATCH_26' | 'BATCH_27' | 'BATCH_28';
 type CourseStatus = 'ADMISSION' | 'ONGOING' | 'COMPLETE';
 
@@ -217,7 +217,7 @@ async function main() {
     //   ],
     // },
     // {
-    //   name: 'ADMISSION',
+    //   name: 'ADVANCED_ADMISSION',
     //   fee: 10000,
     //   description: 'University admission preparation',
     //   hscBatch: 'BATCH_27',

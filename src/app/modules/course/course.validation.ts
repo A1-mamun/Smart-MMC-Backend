@@ -4,7 +4,8 @@ const courseNames = [
   'HSC_1ST_YEAR',
   'HSC_2ND_YEAR',
   'HSC_FINAL_PREPARATION',
-  'ADMISSION',
+  'ADVANCED_ADMISSION',
+  'ENGINEERING_AND_VARSITY_ADMISSION',
 ] as const;
 
 const courseStatuses = ['ADMISSION', 'ONGOING', 'COMPLETE'] as const;

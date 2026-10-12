@@ -170,6 +170,118 @@ const getAllCoursesFromDB = async (filters: TGetAllCourses) => {
   return { data, meta: { page, limit, total } };
 };
 
+/**
+ * Public landing-page listing of courses currently open for
+ * admission. No auth, no PII — returns only ADMISSION-status,
+ * non-deleted courses with their batch days AND a per-slot
+ * seat breakdown so the landing page can show "X / Y seats —
+ * Full / Open" badges without a second round-trip.
+ *
+ * Sorted newest-first by creation so the freshest batches
+ * surface at the top of the grid.
+ *
+ * The per-slot enrolled count is derived from `StudentBatch`
+ * (the same source `getCourseSeatsFromDB` uses) via a single
+ * `groupBy` over all courses returned. We can't scope the
+ * `groupBy` to multiple courses with a Prisma `IN` filter that
+ * also nests `batchDayRel.courseId` cleanly, so we group by
+ * `batchDayId` only and bucket the rows into the courses on
+ * the client side. The set is small (only ADMISSION-status
+ * courses), so the loop is cheap.
+ */
+const getPublicAdmissionCoursesFromDB = async () => {
+  const courses = await prisma.course.findMany({
+    where: {
+      isDeleted: false,
+      status: 'ADMISSION',
+    },
+    orderBy: { createdAt: 'desc' },
+    include: {
+      ...courseInclude,
+      // We need the BatchDay id on each row so we can match
+      // the seat counts below — the default `courseInclude`
+      // includes the days but the `include` above widens it.
+      batchDays: {
+        orderBy: { position: 'asc' as const },
+        select: {
+          id: true,
+          name: true,
+          days: true,
+          times: true,
+          durationMinutes: true,
+        },
+      },
+    },
+  });
+  if (courses.length === 0) return [];
+
+  // Build a flat list of (batchDayId → courseId) so we can map
+  // the groupBy rows back to the right course without a
+  // second DB round-trip per course.
+  const bdToCourse = new Map<string, string>();
+  for (const c of courses) {
+    for (const bd of c.batchDays) bdToCourse.set(bd.id, c.id);
+  }
+
+  const enrolledRows = await prisma.studentBatch.groupBy({
+    by: ['batchDayId', 'batchTime'],
+    where: {
+      isDeleted: false,
+      student: { isDeleted: false },
+      // Scoped to ADMISSION courses only — courses in any other
+      // status can't have new admits, so their per-slot counts
+      // aren't useful on the public landing page.
+      batchDayRel: { courseId: { in: courses.map((c) => c.id) } },
+    },
+    _count: { _all: true },
+  });
+
+  // `batchDayId` is non-null in the schema; the type widens to
+  // `string | null` because the groupBy allows null grouping.
+  // Filter to known BatchDay rows so foreign / orphaned
+  // StudentBatch rows don't poison the map.
+  const enrolledMap = new Map<string, number>();
+  for (const r of enrolledRows) {
+    if (r.batchDayId == null) continue;
+    const key = `${r.batchDayId}__${r.batchTime}`;
+    enrolledMap.set(key, r._count._all ?? 0);
+  }
+
+  return courses.map((c) => {
+    const capacity = c.totalSeats ?? null;
+    const batchDays = c.batchDays.map((bd) => {
+      const slots = (bd.times ?? []).map((time) => {
+        const enrolled = enrolledMap.get(`${bd.id}__${time}`) ?? 0;
+        const isFull =
+          capacity != null && enrolled >= capacity ? true : false;
+        return {
+          time,
+          enrolled,
+          capacity,
+          isFull,
+        };
+      });
+      return {
+        id: bd.id,
+        name: bd.name ?? null,
+        days: bd.days,
+        times: bd.times,
+        durationMinutes: bd.durationMinutes,
+        slots,
+      };
+    });
+    return {
+      ...c,
+      // Replace the raw `batchDays` (which still has admin-only
+      // fields like `slotStates` and `manualWindowOverride`)
+      // with the public-shaped projection. The first spread
+      // carries the rest of the course fields; this overwrite
+      // narrows `batchDays` to the public shape.
+      batchDays,
+    };
+  });
+};
+
 const getCourseByIdFromDB = async (id: string) => {
   const course = await prisma.course.findUnique({
     where: { id },
@@ -1015,6 +1127,7 @@ const setSlotWindowOverrideToDB = async (
 export const CourseService = {
   createCourseToDB,
   getAllCoursesFromDB,
+  getPublicAdmissionCoursesFromDB,
   getCourseByIdFromDB,
   getCourseSeatsFromDB,
   updateCourseInDB,

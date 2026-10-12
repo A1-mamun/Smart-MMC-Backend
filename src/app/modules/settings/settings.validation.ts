@@ -117,8 +117,103 @@ export type TSettingsConfig = {
   examAbsence: TExamAbsenceConfig;
 };
 
+/**
+ * Instructor-section "stats" config. Surfaced on the public
+ * landing page next to the lead-instructor bio; editable from
+ * the super-admin Settings page so the headline numbers (e.g.
+ * "10+ Years Teaching", "10000+ Students Mentored") can be
+ * refreshed without a deploy.
+ *
+ * `value` is a freeform short string (e.g. "10+", "2000+",
+ * "95%") — anything that fits a single-line stat label.
+ * `label` is the human-readable caption (e.g. "Years Teaching",
+ * "Placed to Top Universities"). Order in the array = order on
+ * the landing page. We cap at 6 entries to keep the layout
+ * tidy; the current layout is a 3-col grid on `sm+`.
+ */
+const instructorStatSchema = z.object({
+  value: z
+    .string()
+    .trim()
+    .min(1, 'Stat value is required')
+    .max(20, 'Stat value must be 20 characters or fewer'),
+  label: z
+    .string()
+    .trim()
+    .min(1, 'Stat label is required')
+    .max(60, 'Stat label must be 60 characters or fewer'),
+});
+
+export const instructorSectionSchema = z.object({
+  stats: z
+    .array(instructorStatSchema)
+    .min(1, 'At least one stat is required')
+    .max(6, 'Maximum 6 stats are allowed'),
+  /**
+   * Optional pull-quote rendered under the lead-instructor
+   * name on the public landing page. Empty / missing → the
+   * section omits the quote block entirely. The 500-char cap
+   * mirrors the existing bio description so the quote can't
+   * blow up the card layout.
+   */
+  quote: z.string().trim().max(500).optional().nullable(),
+});
+
+/**
+ * PATCH-shaped upsert for the instructor section. Mirrors the
+ * exam-absence pattern: every field optional, server merges
+ * with the stored row + re-validates the merged result before
+ * writing. A full `stats: []` replacement is the only way to
+ * update the list (no per-index PATCH) — the admin UI is
+ * simple enough that re-saving the whole list per edit is
+ * cheaper than building a sparse PATCH protocol.
+ *
+ * `quote` uses `.nullish()` semantics: an empty string, `null`,
+ * or `undefined` all clear the stored quote (the public page
+ * then omits the block). To preserve the existing value, omit
+ * the field entirely.
+ */
+export const upsertInstructorSectionSchema = z.object({
+  body: z.object({
+    stats: z.array(instructorStatSchema).min(1).max(6).optional(),
+    quote: z
+      .string()
+      .trim()
+      .max(500, 'Quote must be 500 characters or fewer')
+      .nullish(),
+  }),
+});
+
 export const SettingsValidation = {
   upsertConfigSchema,
+  upsertInstructorSectionSchema,
+};
+
+export type TInstructorStat = z.infer<typeof instructorStatSchema>;
+export type TInstructorSection = z.infer<typeof instructorSectionSchema>;
+export type TInstructorSectionPatch = z.infer<
+  typeof upsertInstructorSectionSchema
+>['body'];
+
+/**
+ * Default stats — what the landing page shows before the
+ * super admin has saved anything. Mirrors the values that
+ * were hardcoded in `InstructorSection.tsx` before this
+ * feature went dynamic, so a freshly-deployed instance
+ * doesn't render an empty stats row.
+ */
+export const DEFAULT_INSTRUCTOR_STATS: TInstructorStat[] = [
+  { value: '10+', label: 'Years Teaching' },
+  { value: '10000+', label: 'Students Mentored' },
+  { value: '2000+', label: 'Placed to Top Universities' },
+];
+
+export const DEFAULT_INSTRUCTOR_SECTION: TInstructorSection = {
+  stats: DEFAULT_INSTRUCTOR_STATS,
+  // Pre-fill the original quote so a freshly-deployed instance
+  // keeps the same hero copy until the super admin edits it.
+  quote:
+    "Education isn't about memorising answers — it's about building thinkers. Every student who walks in here deserves a teacher who believes in them first.",
 };
 
 export { weekdayEnum };

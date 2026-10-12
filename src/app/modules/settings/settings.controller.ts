@@ -65,9 +65,45 @@ const runExamAbsenceWarningNow = catchAsync(async (req, res) => {
   });
 });
 
+/**
+ * Public read of the instructor-section stats. No auth — the
+ * landing page renders this for anonymous visitors, so the
+ * route must be reachable before the JWT middleware runs.
+ * Cached for 60s server-side.
+ */
+const getInstructorSection = catchAsync(async (_req, res) => {
+  const config = await SettingsService.getInstructorSectionFromDB();
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Instructor section fetched',
+    data: config,
+  });
+});
+
+/**
+ * Super-admin upsert for the instructor section. Mutating the
+ * headline stats is a brand-level decision — gated to SUPER_ADMIN
+ * just like the rest of the Settings PUT endpoints.
+ */
+const upsertInstructorSection = catchAsync(async (req, res) => {
+  const config = await SettingsService.upsertInstructorSectionInDB(
+    req.body,
+    req.user as never,
+  );
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Instructor section updated',
+    data: config,
+  });
+});
+
 export const SettingsController = {
   getConfig,
   upsertConfig,
   runAbsentWarningNow,
   runExamAbsenceWarningNow,
+  getInstructorSection,
+  upsertInstructorSection,
 };

@@ -33,6 +33,22 @@ const getAllCourses = catchAsync(async (req, res) => {
   });
 });
 
+/**
+ * Public read of admission-open courses. Wired to
+ * `GET /course/public/admission`. No auth; cached 60s server-side
+ * (see route). Only the four fields the landing-page card needs
+ * are kept; the full Course row never leaves the server.
+ */
+const getPublicAdmissionCourses = catchAsync(async (_req, res) => {
+  const courses = await CourseService.getPublicAdmissionCoursesFromDB();
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Admission courses retrieved successfully',
+    data: courses,
+  });
+});
+
 const getCourseById = catchAsync(async (req, res) => {
   const result = await CourseService.getCourseByIdFromDB(req.params.id as string);
   sendResponse(res, {
@@ -169,6 +185,7 @@ const setSlotWindowOverride = catchAsync(async (req, res) => {
 export const CourseController = {
   createCourse,
   getAllCourses,
+  getPublicAdmissionCourses,
   getCourseById,
   getCourseSeats,
   updateCourse,

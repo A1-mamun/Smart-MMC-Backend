@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const attendanceMethods = ['NFC', 'MANUAL', 'ADMIN'] as const;
+// const attendanceMethods = ['NFC', 'MANUAL', 'ADMIN'] as const;
 
 const checkInSchema = z.object({
   body: z.object({
