@@ -5,7 +5,6 @@ import { ExamValidation } from './exam.validation';
 import Auth from '../../middlewares/auth';
 import { USER_ROLE } from '../../constant/userConstant';
 import { writeOperationRateLimiter } from '../../middlewares/rateLimiter';
-import { cache } from '../../middlewares/cache';
 
 const router = express.Router();
 
