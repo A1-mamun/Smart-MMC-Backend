@@ -2,6 +2,7 @@ import httpStatus from 'http-status';
 import catchAsync from '../../utils/catchAsync';
 import sendResponse from '../../utils/sendResponse';
 import { StatsService } from './stats.service';
+import { JwtPayload } from 'jsonwebtoken';
 
 const getAdmissionComparison = catchAsync(async (req, res) => {
   const result = await StatsService.getAdmissionComparisonFromDB(
@@ -45,9 +46,21 @@ const getPaymentMethodBreakdown = catchAsync(async (_req, res) => {
   });
 });
 
+const getOngoingCourseStats = catchAsync(async (req, res) => {
+  const role = (req.user as JwtPayload).role;
+  const result = await StatsService.getOngoingCourseStatsFromDB(role);
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: 'Ongoing course stats retrieved successfully',
+    data: result,
+  });
+});
+
 export const StatsController = {
   getAdmissionComparison,
   getBatchWiseCourseStats,
   getCollectionTrend,
   getPaymentMethodBreakdown,
+  getOngoingCourseStats,
 };

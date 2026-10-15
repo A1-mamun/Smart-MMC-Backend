@@ -195,21 +195,21 @@ model User {
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
-  student            Student?               @relation("UserStudent")
-  refreshTokens      RefreshToken[]
-  passwordResets     PasswordResetRequest[]
-  admittedStudents   Student[]              @relation("AdmittedBy")
-  collectedPayments  Payment[]              @relation("CollectedBy")
-  smsLogs            SmsLog[]               @relation("SmsSentBy")
-  examsCreated       Exam[]                 @relation("ExamCreatedBy")
-  examsPublished     Exam[]                 @relation("ExamPublishedBy")
-  examResultsUpdated ExamResult[]           @relation("ExamResultUpdatedBy")
-  settingsUpdated    Setting[]              @relation("SettingUpdatedBy")
-  bannersCreated     Banner[]               @relation("BannerCreatedBy")
-  successStudentsCreated SuccessStudent[]   @relation("SuccessStudentCreatedBy")
-  ppsCreated         Pp[]                  @relation("PpCreatedBy")
-  ppPaymentsMade     PpPayment[]           @relation("PpPaymentPaidBy")
-  coursesCompleted   Course[]               @relation("CourseCompletedBy")
+  student                Student?               @relation("UserStudent")
+  refreshTokens          RefreshToken[]
+  passwordResets         PasswordResetRequest[]
+  admittedStudents       Student[]              @relation("AdmittedBy")
+  collectedPayments      Payment[]              @relation("CollectedBy")
+  smsLogs                SmsLog[]               @relation("SmsSentBy")
+  examsCreated           Exam[]                 @relation("ExamCreatedBy")
+  examsPublished         Exam[]                 @relation("ExamPublishedBy")
+  examResultsUpdated     ExamResult[]           @relation("ExamResultUpdatedBy")
+  settingsUpdated        Setting[]              @relation("SettingUpdatedBy")
+  bannersCreated         Banner[]               @relation("BannerCreatedBy")
+  successStudentsCreated SuccessStudent[]       @relation("SuccessStudentCreatedBy")
+  ppsCreated             Pp[]                   @relation("PpCreatedBy")
+  ppPaymentsMade         PpPayment[]            @relation("PpPaymentPaidBy")
+  coursesCompleted       Course[]               @relation("CourseCompletedBy")
 
   // ─── Index strategy ─────────────────────────────────────────────────────
   //
@@ -654,6 +654,16 @@ model Exam {
   title               String               @db.VarChar(200)
   syllabus            String               @db.Text
   examDate            DateTime             @db.Date
+  // Wall-clock window for the exam on `examDate`. The kiosk
+  // schedule uses these to compute "happening now" / "upcoming
+  // today" indicators, and the public landing page lists them
+  // next to the exam title. Nullable for backward compat with
+  // legacy rows that only stored a date — those still render
+  // correctly (just without a precise time). `endTime` MUST
+  // be after `startTime` when both are set (validated at the
+  // API layer).
+  startTime           DateTime?
+  endTime             DateTime?
   courseId            String
   totalMarks          Int // denormalised: sum of ExamSection.totalMarks
   isResultPublished   Boolean              @default(false)
@@ -664,6 +674,7 @@ model Exam {
   publishedBy         User?                @relation("ExamPublishedBy", fields: [publishedById], references: [id], onDelete: SetNull)
   course              Course               @relation(fields: [courseId], references: [id], onDelete: Restrict)
   sections            ExamSection[]
+  schedules           ExamSchedule[]
   results             ExamResult[]
   examAbsenceWarnings ExamAbsenceWarning[]
   createdAt           DateTime             @default(now())
@@ -690,6 +701,46 @@ model ExamSection {
   @@unique([examId, name])
   @@index([examId])
   @@map("exam_sections")
+}
+
+/**
+ * Per-exam weekly schedule slot. Mirrors `BatchDay` shape so the
+ * kiosk can render the exam timetable using the same UI primitives
+ * as the course schedule:
+ * - `days[]`  — array of weekday names this slot is held on
+ * ("Sunday".."Saturday"), so an exam can run
+ * across multiple weekly occurrences.
+ * - `times[]` — array of "h:mm AM/PM" start times, parallel
+ * to `days[]` for daily slots and to
+ * `slotStates[]` / `manualWindowOverride[]` for
+ * the per-slot admit flag.
+ * - `durationMinutes` — per-slot exam length in minutes.
+ * - `slotStates[]` / `manualWindowOverride[]` — same per-slot
+ * admit-gate / check-in-window semantics as
+ * `BatchDay`. Most exams won't use these (they
+ * fire once, not weekly), but keeping the same
+ * shape means future exam-absence / check-in
+ * features can plug in without a schema bump.
+ * `position` orders the rows for the kiosk (lower first). The
+ * primary use case today is "display the exam's weekly schedule
+ * on the kiosk", not "administer a multi-slot exam session".
+ */
+model ExamSchedule {
+  id                   String    @id @default(uuid())
+  examId               String
+  exam                 Exam      @relation(fields: [examId], references: [id], onDelete: Cascade)
+  name                 String?
+  days                 String[]  @default([])
+  times                String[]  @default([])
+  durationMinutes      Int       @default(60)
+  slotStates           Boolean[] @default([])
+  manualWindowOverride Boolean[] @default([])
+  position             Int       @default(0)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([examId])
+  @@map("exam_schedules")
 }
 
 model ExamResult {
@@ -964,18 +1015,18 @@ model SuccessStudent {
 // Soft-delete via `isDeleted` (matching the rest of the schema) so
 // the audit trail of payouts is never lost when a PP is removed.
 model Pp {
-  id          String   @id @default(uuid())
-  name        String   @db.VarChar(100)
+  id          String    @id @default(uuid())
+  name        String    @db.VarChar(100)
   createdById String
-  createdBy   User     @relation("PpCreatedBy", fields: [createdById], references: [id])
-  isDeleted   Boolean  @default(false)
+  createdBy   User      @relation("PpCreatedBy", fields: [createdById], references: [id])
+  isDeleted   Boolean   @default(false)
   deletedAt   DateTime?
   deletedBy   String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
-  students  Student[]
-  payments  PpPayment[]
+  students Student[]
+  payments PpPayment[]
 
   @@index([isDeleted])
   @@index([name])
@@ -1000,9 +1051,9 @@ model PpPayment {
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
 
-  pp         Pp      @relation(fields: [ppId], references: [id], onDelete: Cascade)
+  pp         Pp       @relation(fields: [ppId], references: [id], onDelete: Cascade)
   student    Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
-  paidByUser User    @relation("PpPaymentPaidBy", fields: [paidBy], references: [id])
+  paidByUser User     @relation("PpPaymentPaidBy", fields: [paidBy], references: [id])
 
   @@index([ppId])
   @@index([studentId])

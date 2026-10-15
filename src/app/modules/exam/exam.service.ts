@@ -19,6 +19,7 @@ import {
   TListExams,
   TGetMyResults,
   TGetMyUpcomingExams,
+  TExamScheduleInput,
 } from './exam.validation';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -36,6 +37,52 @@ import {
  */
 const isTruthyQuery = (v: unknown): boolean =>
   v === true || v === 'true' || v === '1' || v === 1;
+
+/**
+ * Pad / trim a per-slot boolean array to match `times.length`.
+ * Mirrors the same helper on the course side (`BatchDay`'s
+ * `slotStates` / `manualWindowOverride`) so the exam schedules
+ * keep the parallel-to-`times[]` invariant the kiosk relies on.
+ */
+const normaliseBooleanArray = (
+  incoming: boolean[] | undefined,
+  timesLength: number,
+  defaultValue: boolean,
+): boolean[] => {
+  const result: boolean[] = [];
+  for (let i = 0; i < timesLength; i++) {
+    if (incoming && i < incoming.length) {
+      result.push(Boolean(incoming[i]));
+    } else {
+      result.push(defaultValue);
+    }
+  }
+  return result;
+};
+
+/**
+ * Build the per-exam schedule row payload for a Prisma
+ * `createMany`. Mirrors the course-side `BatchDay` shape so the
+ * kiosk can render both with the same UI primitives.
+ */
+const buildExamScheduleCreateRows = (
+  examId: string,
+  schedules: TExamScheduleInput[],
+): Prisma.ExamScheduleCreateManyInput[] =>
+  schedules.map((s, idx) => ({
+    examId,
+    name: s.name ?? null,
+    days: s.days,
+    times: s.times,
+    durationMinutes: s.durationMinutes,
+    slotStates: normaliseBooleanArray(s.slotStates, s.times.length, true),
+    manualWindowOverride: normaliseBooleanArray(
+      s.manualWindowOverride,
+      s.times.length,
+      false,
+    ),
+    position: idx,
+  }));
 
 /**
  * Build the section payload for a Prisma `createMany`. Computes `totalMarks`
@@ -246,11 +293,30 @@ const createExamToDB = async (payload: TCreateExam, user: JwtPayload) => {
         title: payload.title.trim(),
         syllabus: payload.syllabus,
         examDate: examDateLocal,
+        // Wall-clock window. `startTime` / `endTime` are
+        // independently optional on the wire — a date-only
+        // create stores NULL for both. The Zod superRefine
+        // already verified endTime > startTime when both are
+        // present; the JS check below is a belt-and-braces
+        // guard for the (rare) case where the middleware is
+        // bypassed (e.g. an internal cron directly invoking
+        // the service).
+        startTime: payload.startTime ?? null,
+        endTime: payload.endTime ?? null,
         courseId: course.id,
         totalMarks,
         createdById: user.userId,
       },
     });
+
+    // Optional weekly schedule (days + times). Empty / omitted
+    // = no schedule rows — the kiosk then renders the exam by
+    // `examDate` + `startTime`/`endTime` alone.
+    if (payload.examSchedules && payload.examSchedules.length > 0) {
+      await tx.examSchedule.createMany({
+        data: buildExamScheduleCreateRows(exam.id, payload.examSchedules),
+      });
+    }
 
     await tx.examSection.createMany({
       data: buildSectionCreateRows(exam.id, sections),
@@ -322,7 +388,10 @@ const createExamToDB = async (payload: TCreateExam, user: JwtPayload) => {
 
     return tx.exam.findUnique({
       where: { id: exam.id },
-      include: { sections: { orderBy: { position: 'asc' } } },
+      include: {
+        sections: { orderBy: { position: 'asc' } },
+        schedules: { orderBy: { position: 'asc' } },
+      },
     });
   });
 };
@@ -374,6 +443,12 @@ const updateExamToDB = async (
     const meta: Prisma.ExamUpdateInput = {};
     if (payload.title !== undefined) meta.title = payload.title.trim();
     if (payload.syllabus !== undefined) meta.syllabus = payload.syllabus;
+    // Wall-clock window. `null` clears the field, undefined
+    // leaves it alone. The Zod superRefine on the update
+    // schema verified endTime > startTime when both are
+    // present; we don't re-check here.
+    if (payload.startTime !== undefined) meta.startTime = payload.startTime;
+    if (payload.endTime !== undefined) meta.endTime = payload.endTime;
     if (examDateUpdate) {
       // Re-shape the incoming + existing dates to be BD-anchored UTC
       // midnights so the equality check below compares BD calendar
@@ -561,6 +636,20 @@ const updateExamToDB = async (
       meta.totalMarks = allSec.reduce((acc, s) => acc + s.totalMarks, 0);
     }
 
+    // Full-replace the weekly schedule. `examSchedules: []`
+    // wipes the existing rows; omitting the field leaves
+    // them alone. The list is capped at 7 rows by the
+    // schema, so a full re-insert is cheap and keeps the
+    // position ordering straightforward.
+    if (payload.examSchedules !== undefined) {
+      await tx.examSchedule.deleteMany({ where: { examId: id } });
+      if (payload.examSchedules.length > 0) {
+        await tx.examSchedule.createMany({
+          data: buildExamScheduleCreateRows(id, payload.examSchedules),
+        });
+      }
+    }
+
     const updated = await tx.exam.update({ where: { id }, data: meta });
     await tx.activityLog.create({
       data: {
@@ -573,7 +662,13 @@ const updateExamToDB = async (
         metadata: { changed: Object.keys(payload) },
       },
     });
-    return updated;
+    return tx.exam.findUnique({
+      where: { id },
+      include: {
+        sections: { orderBy: { position: 'asc' } },
+        schedules: { orderBy: { position: 'asc' } },
+      },
+    });
   });
 };
 
@@ -1246,6 +1341,20 @@ const getAllExamsFromDB = async (
       orderBy: { [sortBy || 'createdAt']: sortOrder || 'desc' },
       include: {
         course: { select: { id: true, name: true } },
+        // Weekly schedule rows so the create/edit form can
+        // pre-fill them. `startTime` / `endTime` are
+        // first-class on the `Exam` model and don't need a
+        // relation to land in the response.
+        schedules: {
+          orderBy: { position: 'asc' },
+          select: {
+            id: true,
+            name: true,
+            days: true,
+            times: true,
+            durationMinutes: true,
+          },
+        },
         _count: { select: { results: true, sections: true } },
       },
     }),
