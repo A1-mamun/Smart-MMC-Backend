@@ -839,15 +839,23 @@ const getCurrentBatchFromDB = async (): Promise<TCurrentBatch> => {
     };
   }
 
-  // No current slot — find the next upcoming one (any slot whose
-  // start is in the future). We pick the earliest so the kiosk
-  // can pre-announce the next class. The slotEnabled flag is
-  // NOT filtered here — the kiosk's pre-announce message can
-  // mention the soonest scheduled slot regardless of its
-  // current admit state, so the operator sees what's coming
-  // up next.
+  // No current slot — find the next upcoming one. We pick the
+  // earliest so the kiosk can pre-announce the next class.
+  //
+  // Filter on `slotEnabled === true` here so an admin-toggled-OFF
+  // slot never surfaces as "upcoming" on the kiosk. The kiosk
+  // shows the upcoming batch as the *next* class the operator
+  // should be ready for — surfacing a slot the admin has
+  // explicitly disabled would mislead the operator into setting
+  // up for a class that isn't actually running. We deliberately
+  // do NOT show OFF slots even as informational pre-announcements:
+  // the Courses page is the single source of truth for which
+  // slots are toggled on, and the kiosk should stay aligned with
+  // that truth. If every slot is OFF, fall through to `{ kind:
+  // 'none' }` so the kiosk shows the calm "no class scheduled
+  // today" view instead of an empty pre-announce.
   const upcomingSlots = slots
-    .filter((s) => s.minutes > todayMinutes)
+    .filter((s) => s.minutes > todayMinutes && s.slotEnabled === true)
     .sort((a, b) => a.minutes - b.minutes);
   if (upcomingSlots.length === 0) return { kind: 'none' };
   const next = upcomingSlots[0];

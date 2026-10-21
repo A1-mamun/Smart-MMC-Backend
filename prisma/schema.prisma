@@ -94,6 +94,11 @@ enum SmsLogStatus {
 enum SmsSendMode {
   ONE_TO_ONE
   ONE_TO_MANY
+  // System-generated SMS fired automatically by the backend
+  // when a course fee is fully settled. Surfaces in the SMS
+  // audit log so admins can see what the system sent (vs.
+  // what staff sent manually).
+  PAYMENT_CONFIRMATION
 }
 
 enum AttendanceMethod {

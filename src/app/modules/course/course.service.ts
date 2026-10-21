@@ -901,7 +901,13 @@ const toggleBatchSlotToDB = async (
 
   const batchDay = await prisma.batchDay.findUnique({
     where: { id: payload.batchDayId },
-    select: { id: true, courseId: true, times: true, slotStates: true },
+    select: {
+      id: true,
+      courseId: true,
+      times: true,
+      slotStates: true,
+      manualWindowOverride: true,
+    },
   });
   if (!batchDay || batchDay.courseId !== courseId) {
     throw new AppError(httpStatus.NOT_FOUND, 'BatchDay not found in this course');
@@ -921,9 +927,40 @@ const toggleBatchSlotToDB = async (
   const padded = normaliseSlotStates(batchDay.slotStates, batchDay.times.length);
   padded[payload.slotIndex] = payload.enabled;
 
+  /*
+   * Coupled cascade: turning a slot OFF must also turn OFF the
+   * matching per-slot "window override" (the "skip the 5-min
+   * wall-clock guard" switch). A window-override is meaningless
+   * on a slot that isn't admitting — the kiosk's check-in guard
+   * already rejects scans for OFF slots regardless of the
+   * override state, so leaving the override on would be a dead
+   * flag that confuses the next admin who opens this course.
+   *
+   * Only fires on the OFF direction; turning a slot ON leaves
+   * any existing override untouched (the admin explicitly
+   * enables the override via its own switch, which still gates
+   * on `slotStates[i] === true`).
+   *
+   * Single transaction with the slot-state write so the two
+   * flags can never be observed out of sync by a follow-up
+   * `getCurrentBatch` poll.
+   */
+  const updateData: { slotStates: boolean[]; manualWindowOverride?: boolean[] } = {
+    slotStates: padded,
+  };
+  if (payload.enabled === false) {
+    const paddedOverride = normaliseBooleanArray(
+      batchDay.manualWindowOverride,
+      batchDay.times.length,
+      false,
+    );
+    paddedOverride[payload.slotIndex] = false;
+    updateData.manualWindowOverride = paddedOverride;
+  }
+
   const updated = await prisma.batchDay.update({
     where: { id: batchDay.id },
-    data: { slotStates: padded },
+    data: updateData,
     include: { course: { select: { id: true, name: true } } },
   });
 

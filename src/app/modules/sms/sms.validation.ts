@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const smsModes = ['ONE_TO_ONE', 'ONE_TO_MANY'] as const;
+const smsModes = ['ONE_TO_ONE', 'ONE_TO_MANY', 'PAYMENT_CONFIRMATION'] as const;
 
 /**
  * Each recipient is the bare minimum needed by the gateway and the audit

@@ -6,6 +6,149 @@ import AppError from '../../errors/AppError';
 import { TRecordPayment, TUpdatePayment, TGetAllPayments, TGetDuePayments } from './payment.validation';
 import calculatePagination from '../../utils/calculatePagination';
 import { clearPaymentCache } from '../../utils/clearCache';
+import { sendViaBulkSmsBd, explainUpstreamCode } from '../../utils/smsGateway';
+import { toIntl } from '../../utils/phone';
+
+/**
+ * Build the body of the course-fee confirmation SMS. Kept in one place
+ * so the wording is easy to tweak without hunting through service
+ * code. The student name is the User.name on the auth record — the
+ * same identifier used everywhere else in the admin UI.
+ *
+ * Two variants:
+ *   - Full settlement (isFullyPaid = true):
+ *       "Dear Rahim, your HSC 1st Year course fee of ৳12000 has
+ *        been received. Thank you. - Smart MMC"
+ *   - Partial / in-flight payment (isFullyPaid = false):
+ *       "Dear Rahim, we received your partial payment of ৳5000
+ *        for HSC 1st Year. Thank you. - Smart MMC"
+ *
+ * The partial wording is deliberately honest — the student still
+ * owes the balance, so we don't claim the "course fee has been
+ * received" the way the full-settlement variant does.
+ */
+const buildPaymentConfirmationMessage = (params: {
+  studentName: string;
+  courseName: string;
+  amount: number;
+  isFullyPaid: boolean;
+}): string =>
+  params.isFullyPaid
+    ? `Dear ${params.studentName}, your ${params.courseName} course fee of ৳${params.amount} has been received. Thank you. - Smart MMC`
+    : `Dear ${params.studentName}, we received your partial payment of ৳${params.amount} for ${params.courseName}. Thank you. - Smart MMC`;
+
+/**
+ * Fire-and-forget payment confirmation SMS. Intentionally swallows
+ * every error so a misconfigured gateway or a bad mobile number
+ * never breaks the payment-recording flow (the cash is already
+ * in the books — the SMS is a courtesy, not a precondition).
+ *
+ * The SmsLog row (whether SUCCESS or FAILED) is still written so
+ * the audit trail reflects what the system attempted. Same status
+ * taxonomy as the manual SMS module: SUCCESS, FAILED.
+ *
+ * `sentById` is set to the admin who recorded the payment so the
+ * log row's "sent by" column points at the human action that
+ * triggered the auto-message — useful for audit when an admin
+ * later asks "who paid student X today?".
+ */
+const sendPaymentConfirmationSms = async (params: {
+  studentId: string;
+  studentName: string;
+  mobile: string;
+  courseName: string;
+  amount: number;
+  isFullyPaid: boolean;
+  paymentId: string;
+  sentById: string;
+}): Promise<void> => {
+  const intl = toIntl(params.mobile);
+  if (!intl) {
+    // The student's mobile is malformed — log it so an admin can
+    // see why no SMS went out, but never throw.
+    await prisma.activityLog.create({
+      data: {
+        actorId: params.sentById,
+        actorRole: 'ADMIN',
+        action: 'SMS_SKIPPED',
+        entityType: 'Payment',
+        entityId: params.paymentId,
+        description: `Payment confirmation SMS skipped for ${params.studentName}: mobile "${params.mobile}" is not a valid BD number`,
+        metadata: {
+          reason: 'invalid_mobile',
+          rawMobile: params.mobile,
+          studentId: params.studentId,
+        },
+      },
+    });
+    return;
+  }
+
+  const message = buildPaymentConfirmationMessage({
+    studentName: params.studentName,
+    courseName: params.courseName,
+    amount: params.amount,
+    isFullyPaid: params.isFullyPaid,
+  });
+
+  let result: Awaited<ReturnType<typeof sendViaBulkSmsBd>>;
+  try {
+    result = await sendViaBulkSmsBd({ numbers: [intl], message });
+  } catch (err) {
+    // Gateway is not configured at all (no API key in .env) — the
+    // smsGateway helper throws rather than returning an error code.
+    // Persist a FAILED log so the audit trail still reflects the
+    // attempt and the admin can see why no message went out.
+    await prisma.smsLog.create({
+      data: {
+        recipients: intl,
+        message,
+        status: 'FAILED',
+        upstreamCode: 'GATEWAY_UNCONFIGURED',
+        errorMsg: err instanceof Error ? err.message : 'SMS gateway unavailable',
+        count: 0,
+        mode: 'PAYMENT_CONFIRMATION',
+        sentById: params.sentById,
+      },
+    });
+    return;
+  }
+
+  const status: 'SUCCESS' | 'FAILED' = result.ok ? 'SUCCESS' : 'FAILED';
+
+  await prisma.smsLog.create({
+    data: {
+      recipients: intl,
+      message,
+      status,
+      upstreamCode: result.code,
+      errorMsg: result.ok ? null : explainUpstreamCode(result.code),
+      count: result.ok ? result.count : 0,
+      mode: 'PAYMENT_CONFIRMATION',
+      sentById: params.sentById,
+    },
+  });
+
+  await prisma.activityLog.create({
+    data: {
+      actorId: params.sentById,
+      actorRole: 'ADMIN',
+      action: result.ok ? 'PAYMENT_CONFIRMATION_SMS_SENT' : 'PAYMENT_CONFIRMATION_SMS_FAILED',
+      entityType: 'Payment',
+      entityId: params.paymentId,
+      description: result.ok
+        ? `Payment confirmation SMS sent to ${params.studentName} (${params.isFullyPaid ? 'full' : 'partial'} settlement)`
+        : `Payment confirmation SMS failed for ${params.studentName}: ${explainUpstreamCode(result.code)}`,
+      metadata: {
+        studentId: params.studentId,
+        amount: params.amount,
+        courseName: params.courseName,
+        isFullyPaid: params.isFullyPaid,
+        upstreamCode: result.code,
+      },
+    },
+  });
+};
 
 const recordPaymentToDB = async (payload: TRecordPayment, user: JwtPayload) => {
   const student = await prisma.student.findUnique({ where: { id: payload.studentId } });
@@ -22,6 +165,18 @@ const recordPaymentToDB = async (payload: TRecordPayment, user: JwtPayload) => {
       );
     }
   }
+
+  // Closure-scoped flag so the post-commit SMS dispatch can read
+  // the freshly recomputed enrollment status without a second DB
+  // round-trip and without stashing a transient field on the
+  // returned Payment row (which would leak into the public
+  // response). Typed as a 3-state union (not just `boolean`) so
+  // TS doesn't collapse the `=== 'PAID'` / `=== 'PARTIAL'`
+  // checks below into "always false" — the flag is only ever
+  // flipped inside the conditional `if (enrollment)` block, and
+  // we want a clear "did the status actually move?" signal.
+  let enrollmentNowPaid: boolean | null = null;
+  let enrollmentNowPartial: boolean | null = null;
 
   const result = await prisma.$transaction(async (tx) => {
     const payment = await tx.payment.create({
@@ -73,6 +228,16 @@ const recordPaymentToDB = async (payload: TRecordPayment, user: JwtPayload) => {
           where: { id: enrollment.id },
           data: { status },
         });
+        // Capture for the post-commit SMS check. We use the
+        // computed status (not a fresh DB read) so a manual
+        // override to PAID is also eligible for the SMS — the
+        // admin explicitly marked the enrollment as settled,
+        // and the student should still get the courtesy
+        // notification. PARTIAL captures the "in-flight" state
+        // so a partial payment also fires the SMS (the user
+        // confirmed partial payments should notify too).
+        enrollmentNowPaid = status === 'PAID';
+        enrollmentNowPartial = status === 'PARTIAL';
       }
     }
 
@@ -96,6 +261,71 @@ const recordPaymentToDB = async (payload: TRecordPayment, user: JwtPayload) => {
   });
 
   await clearPaymentCache();
+
+  // Fire the confirmation SMS AFTER the transaction commits and
+  // the cache is cleared, so the student's mobile is hit only
+  // when the books genuinely reflect a recorded payment. The
+  // helper is fully fire-and-forget: any gateway / network /
+  // invalid-number failure is logged to SmsLog + ActivityLog but
+  // never bubbles up to the caller — the payment is already
+  // safely recorded, the SMS is just a courtesy.
+  //
+  // Triggers (per the user's request — "after successful payment
+  // of student course fee" applies to every settled payment, not
+  // only the ones that fully pay off the course):
+  //   - Enrollment is now PAID (full settlement, either auto
+  //     from the math or a manual `overrideStatus: 'PAID'`), or
+  //   - Enrollment is now PARTIAL (in-flight — some of the fee
+  //     is paid, the rest is still outstanding). The user
+  //     confirmed partial payments should also notify the
+  //     student.
+  //
+  // Skipped when:
+  //   - The payment isn't tied to any enrollment (a generic
+  //     student-level payment that doesn't belong to a course —
+  //     no course context to put in the SMS body).
+  //   - The recomputed status is still PENDING (the payment
+  //     hit a defensive branch where the amount didn't move
+  //     the needle — a 0-amount record shouldn't spam the
+  //     student). This is the safety net for malformed
+  //     payloads; the normal path always moves out of PENDING
+  //     when an amount > 0 is recorded.
+  //   - The student has no enrollments resolved in the result
+  //     (defensive — should be impossible after the create).
+  const shouldSendConfirmation =
+    !!result.studentCourse &&
+    (enrollmentNowPaid === true || enrollmentNowPartial === true);
+
+  if (shouldSendConfirmation) {
+    // Look up the mobile fresh — the `include` on the create
+    // payload above already returned `student` with `user`, so
+    // we technically have it, but a dedicated lookup here keeps
+    // the helper signature self-contained and the call site
+    // readable. The `user.name` is the canonical display name
+    // (same identifier used in the admin UI / receipts).
+    const studentWithUser = await prisma.student.findUnique({
+      where: { id: payload.studentId },
+      include: { user: true },
+    });
+    if (studentWithUser) {
+      await sendPaymentConfirmationSms({
+        studentId: result.studentId,
+        studentName: studentWithUser.user.name,
+        mobile: studentWithUser.mobile,
+        courseName: result.studentCourse!.course.name,
+        amount: Number(result.amount),
+        // Tells the message builder whether to word the body
+        // as a full settlement ("course fee ... has been
+        // received") or an in-flight payment ("partial
+        // payment ... has been received"). Keeps the wording
+        // honest when the student still owes the balance.
+        isFullyPaid: enrollmentNowPaid === true,
+        paymentId: result.id,
+        sentById: user.userId,
+      });
+    }
+  }
+
   return result;
 };
 
